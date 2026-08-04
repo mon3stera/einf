@@ -6,15 +6,17 @@ creating one disposable project per gate.
 
 ## Current stage
 
-**Gate 3 — Continuous batching, chunked prefill, and cache preemption**
+**Gate 3 — Continuous batching, chunked prefill, and cache preemption — happy-path complete**
 
 Gate 2 is happy-path complete: the project has a CPU-only deterministic control
 plane with Scheduler-owned Request lifecycle, transactional logical KV block
 allocation, immutable scheduled batches, and a synchronous fake executor.
 
-Gate 3 currently adds token-budget batching, continuous admission, chunked
-prefill, persistent FCFS and decode-first policies, cache preemption, and
-recompute-oriented Request state.
+Gate 3 is happy-path complete as of 2026-08-04. It adds token-budget
+batching, continuous admission, chunked prefill, persistent FCFS and
+decode-first policies, cache preemption, deterministic recompute, and
+single-request capacity failure without scheduler livelock. Gate 4 is the
+current stage.
 
 ## Language boundary
 
@@ -73,8 +75,9 @@ and attention backend should be added only when their Gate begins.
 - continuous admission and cache-pressure preemption.
 
 The project prioritizes end-to-end happy paths for common inference-engine
-mechanisms. Exhaustive hardening and benchmarks are added when they protect a
-core invariant or answer a concrete performance question.
+mechanisms. Gate 3 fairness aging, randomized stress traces, production error
+classification, and control-plane benchmarks remain non-blocking hardening
+work. Gate 4 begins the GPU block-based KV cache.
 
 ## Development
 

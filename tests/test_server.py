@@ -641,3 +641,132 @@ def test_fcfs_preemption_keeps_older_request_running() -> None:
     assert scheduler._get_request(older_id).state is RequestState.FINISHED
     assert cache_manager.block_table(older_id) == ()
     assert pool.free_len() == 2
+
+    recompute_batch = scheduler.schedule()
+    assert recompute_batch is not None
+    assert len(recompute_batch.requests) == 1
+    recompute = recompute_batch.requests[0]
+    assert recompute.request_id == newer_id
+    assert recompute.work_type is WorkType.PREFILL
+    assert recompute.input_token_ids == (30, 40)
+    assert recompute.start_position == 0
+    assert recompute.need_sample is False
+
+    scheduler.apply_result(executor.execute(recompute_batch))
+    newer = scheduler._get_request(newer_id)
+    assert newer.state is RequestState.RUNNING
+    assert newer.cached_len == 2
+    assert newer.generated_token_ids == [41]
+
+    resumed_decode_batch = scheduler.schedule()
+    assert resumed_decode_batch is not None
+    assert len(resumed_decode_batch.requests) == 1
+    resumed_decode = resumed_decode_batch.requests[0]
+    assert resumed_decode.request_id == newer_id
+    assert resumed_decode.work_type is WorkType.DECODE
+    assert resumed_decode.input_token_ids == (41,)
+    assert resumed_decode.start_position == 2
+    assert resumed_decode.need_sample is True
+
+    scheduler.apply_result(executor.execute(resumed_decode_batch))
+    assert newer.state is RequestState.FINISHED
+    assert newer.completion_reason is CompletionReason.LENGTH
+    assert newer.cached_len == 3
+    assert newer.generated_token_ids == [41, 42]
+    assert cache_manager.block_table(newer_id) == ()
+    assert len(scheduler._policy) == 0
+    assert list(scheduler._waiting) == []
+    assert pool.free_len() == 2
+
+
+def test_decode_first_preempts_prefill_before_decode() -> None:
+    scheduler, cache_manager, pool = make_scheduler(
+        num_blocks=2,
+        block_len=2,
+        max_batch_len=4,
+        max_prefill_chunk_len=2,
+        policy=DecodeFirstPolicy(),
+    )
+    executor = FakeExecutor()
+    prefill_id = scheduler.submit(
+        RequestSpec(
+            request_id="prefill",
+            prompt_token_ids=(30, 40, 50, 60),
+            max_new_len=1,
+        )
+    )
+    decode_id = scheduler.submit(
+        RequestSpec(
+            request_id="decode",
+            prompt_token_ids=(10, 20),
+            max_new_len=2,
+        )
+    )
+
+    first_batch = scheduler.schedule()
+    assert first_batch is not None
+    assert [item.request_id for item in first_batch.requests] == [
+        prefill_id,
+        decode_id,
+    ]
+    assert [item.work_type for item in first_batch.requests] == [
+        WorkType.PREFILL,
+        WorkType.PREFILL,
+    ]
+    assert [item.need_sample for item in first_batch.requests] == [False, True]
+    scheduler.apply_result(executor.execute(first_batch))
+
+    assert [item.request_id for item in scheduler._policy.candidates()] == [
+        decode_id,
+        prefill_id,
+    ]
+
+    decode_batch = scheduler.schedule()
+    assert decode_batch is not None
+    assert [item.request_id for item in decode_batch.requests] == [decode_id]
+    assert decode_batch.requests[0].work_type is WorkType.DECODE
+    assert scheduler._get_request(prefill_id).state is RequestState.WAITING
+    assert scheduler._get_request(prefill_id).cached_len == 0
+    assert cache_manager.block_table(prefill_id) == ()
+    assert [item.request_id for item in scheduler._waiting] == [prefill_id]
+    assert [item.request_id for item in scheduler._policy.candidates()] == [
+        decode_id
+    ]
+
+    scheduler.apply_result(executor.execute(decode_batch))
+    decode = scheduler._get_request(decode_id)
+    assert decode.state is RequestState.FINISHED
+    assert decode.generated_token_ids == [21, 22]
+    assert cache_manager.block_table(decode_id) == ()
+
+    first_recompute_batch = scheduler.schedule()
+    assert first_recompute_batch is not None
+    assert len(first_recompute_batch.requests) == 1
+    first_recompute = first_recompute_batch.requests[0]
+    assert first_recompute.request_id == prefill_id
+    assert first_recompute.work_type is WorkType.PREFILL
+    assert first_recompute.input_token_ids == (30, 40)
+    assert first_recompute.start_position == 0
+    assert first_recompute.need_sample is False
+    scheduler.apply_result(executor.execute(first_recompute_batch))
+
+    final_prefill_batch = scheduler.schedule()
+    assert final_prefill_batch is not None
+    assert len(final_prefill_batch.requests) == 1
+    final_prefill = final_prefill_batch.requests[0]
+    assert final_prefill.request_id == prefill_id
+    assert final_prefill.work_type is WorkType.PREFILL
+    assert final_prefill.input_token_ids == (50, 60)
+    assert final_prefill.start_position == 2
+    assert final_prefill.need_sample is True
+    scheduler.apply_result(executor.execute(final_prefill_batch))
+
+    prefill = scheduler._get_request(prefill_id)
+    assert prefill.state is RequestState.FINISHED
+    assert prefill.completion_reason is CompletionReason.LENGTH
+    assert prefill.cached_len == 4
+    assert prefill.generated_token_ids == [61]
+    assert cache_manager.block_table(prefill_id) == ()
+    assert len(scheduler._policy) == 0
+    assert list(scheduler._waiting) == []
+    assert pool.free_len() == 2

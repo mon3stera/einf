@@ -3,9 +3,9 @@ from einf.cache.pool import BlockPool
 from einf.execution import (
     ExecutionResult,
     Executor,
-    FakeExecutor,
     RequestExecutionResult,
 )
+from einf.executors import FakeExecutor
 from einf.lib import LLMServer
 from einf.request import CompletionReason, RequestSpec, RequestState
 from einf.scheduler import (

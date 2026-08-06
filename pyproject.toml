@@ -12,9 +12,13 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+qwen = ["safetensors>=0.7", "transformers>=5.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"einf.executors.torch.ops" = ["README.md", "csrc/*.h", "csrc/*.cpp", "csrc/*.cu"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

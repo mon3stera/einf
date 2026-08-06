@@ -4,6 +4,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     vocab_size: int
+    num_layers: int
     hidden_size: int
     num_attention_heads: int
     num_kv_heads: int

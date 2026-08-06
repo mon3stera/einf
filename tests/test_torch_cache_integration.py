@@ -1,8 +1,54 @@
+import pytest
 import torch
 
 from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
 from einf.executors.torch.input import ModelInput
 from einf.scheduler import ScheduledBatch, ScheduledRequest, WorkType
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cuda_custom_cache_ops_match_pytorch_reference(dtype: torch.dtype) -> None:
+    geometry = KVCacheGeometry(
+        num_layers=2,
+        num_blocks=5,
+        block_len=2,
+        num_kv_heads=2,
+        head_dim=4,
+    )
+    custom = TorchKVCacheStorage(
+        geometry,
+        dtype=dtype,
+        device="cuda",
+        use_custom_ops=True,
+    )
+    reference = TorchKVCacheStorage(
+        geometry,
+        dtype=dtype,
+        device="cuda",
+        use_custom_ops=False,
+    )
+    custom.K.fill_(-1)
+    custom.V.fill_(-2)
+    reference.K.copy_(custom.K)
+    reference.V.copy_(custom.V)
+
+    slots = torch.tensor([5, 0, 7], dtype=torch.long, device="cuda")
+    K = torch.arange(3 * 2 * 4, dtype=torch.float32, device="cuda")
+    K = K.reshape(3, 2, 4).to(dtype)
+    V = (K.float() + 100).to(dtype)
+
+    custom.write_slots(1, slots, K, V)
+    reference.write_slots(1, slots, K, V)
+
+    block_table = torch.tensor([2, 0, 3], dtype=torch.long, device="cuda")
+    custom_K, custom_V = custom.gather_context(1, block_table, 5)
+    reference_K, reference_V = reference.gather_context(1, block_table, 5)
+
+    torch.testing.assert_close(custom.K, reference.K, rtol=0, atol=0)
+    torch.testing.assert_close(custom.V, reference.V, rtol=0, atol=0)
+    torch.testing.assert_close(custom_K, reference_K, rtol=0, atol=0)
+    torch.testing.assert_close(custom_V, reference_V, rtol=0, atol=0)
 
 
 def test_model_input_writes_current_tokens_into_request_contexts() -> None:

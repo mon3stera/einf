@@ -1,8 +1,7 @@
 //! Stage-0 parity tests for the Rust control plane.
 //!
-//! These tests exercise the public Rust API and mirror the Python baseline
-//! scenarios. Prefix-cache behavior is deliberately absent: each KV block is
-//! request-private.
+//! These tests exercise the public Rust API and preserve the Python baseline
+//! scenarios. Prefix-cache behavior is covered separately in `prefix_cache.rs`.
 
 use einf_control::{
     AdvanceResult, BatchId, CompletionReason, DecodeFirst, ExecutionResult, Fcfs, KvCacheManager,
@@ -36,6 +35,7 @@ fn spec(id: &str, prompt: &[i64], max_new_len: usize) -> RequestSpec {
         request_id: RequestId::from(id),
         prompt_token_ids: prompt.to_vec(),
         max_new_len,
+        sampling_params: einf_control::SamplingParams::default(),
     }
 }
 
@@ -75,6 +75,42 @@ where
     while let Some(batch) = control.schedule().unwrap() {
         control.apply_result(fake_result(&batch)).unwrap();
     }
+}
+
+#[test]
+fn request_rejects_empty_prompt_and_zero_output_budget() {
+    assert!(matches!(
+        einf_control::Request::create(spec("empty", &[], 1), 0),
+        Err(einf_control::ControlError::InvalidConfig(_))
+    ));
+    assert!(matches!(
+        einf_control::Request::create(spec("zero-output", &[1], 0), 0),
+        Err(einf_control::ControlError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+fn sampling_params_validate_and_default_to_greedy() {
+    let default = einf_control::SamplingParams::default();
+    assert!(default.is_greedy());
+    assert_eq!(default.temperature(), 0.0);
+    assert!(einf_control::SamplingParams::new(0.0, Some(1), 1.0, 0.0, 0, vec![], 0).is_err());
+    assert!(einf_control::SamplingParams::new(f32::NAN, None, 1.0, 0.0, 0, vec![], 0).is_err());
+    assert!(einf_control::SamplingParams::new(1.0, Some(0), 1.0, 0.0, 0, vec![], 0).is_err());
+    assert!(einf_control::SamplingParams::new(1.0, None, 0.0, 0.0, 0, vec![], 0).is_err());
+
+    let random =
+        einf_control::SamplingParams::new(0.75, Some(50), 0.95, 0.05, 123, vec![2, 3], 4).unwrap();
+    assert!(!random.is_greedy());
+    assert_eq!(random.temperature(), 0.75);
+
+    assert!(
+        einf_control::SamplingParams::new(1.0, None, 1.0, 0.0, i64::MAX as u64, vec![], 0,).is_ok()
+    );
+    assert!(
+        einf_control::SamplingParams::new(1.0, None, 1.0, 0.0, i64::MAX as u64 + 1, vec![], 0,)
+            .is_err()
+    );
 }
 
 #[test]
@@ -124,30 +160,30 @@ fn request_lifecycle_matches_python_baseline() {
 #[test]
 fn block_pool_and_kv_cache_match_python_baseline() {
     let mut pool = einf_control::BlockPool::new(4);
-    let reservation = pool.reserve(2).unwrap();
+    let reservation = pool.reserve(2, RequestId::from("pool-test")).unwrap();
     assert_eq!(
         reservation.blocks(),
         &[einf_control::BlockId(0), einf_control::BlockId(1)]
     );
     pool.release(reservation).unwrap();
     assert_eq!(pool.available(), 4);
-    assert!(pool.reserve(5).is_err());
+    assert!(pool.reserve(5, RequestId::from("pool-test")).is_err());
     assert_eq!(pool.available(), 4);
 
     let mut cache = KvCacheManager::new(3, 4).unwrap();
     let id = RequestId::from("req-1");
-    cache.reserve_to(id.clone(), 3).unwrap();
+    cache.reserve_to(id.clone(), None, 3).unwrap();
     assert_eq!(
         cache.block_table(id.clone()),
         vec![einf_control::BlockId(0)]
     );
-    cache.reserve_to(id.clone(), 5).unwrap();
+    cache.reserve_to(id.clone(), None, 5).unwrap();
     assert_eq!(
         cache.block_table(id.clone()),
         vec![einf_control::BlockId(0), einf_control::BlockId(1)]
     );
     let table_before = cache.block_table(id.clone());
-    assert!(cache.reserve_to(id.clone(), 13).is_err());
+    assert!(cache.reserve_to(id.clone(), None, 13).is_err());
     assert_eq!(cache.block_table(id.clone()), table_before);
     cache.release(id).unwrap();
     assert_eq!(cache.free_blocks(), 3);
@@ -165,13 +201,30 @@ fn batch_plan_matches_python_execution_contract() {
     assert_eq!(item.start_position, 0);
     assert_eq!(item.block_table, vec![einf_control::BlockId(0)]);
     assert!(item.need_sample);
+    assert_eq!(item.sampling_plan.as_ref().unwrap().sample_index, 0);
+    assert!(item.sampling_plan.as_ref().unwrap().params.is_greedy());
     control.apply_result(fake_result(&prefill)).unwrap();
+    assert_eq!(
+        control
+            .request(&RequestId::from("req-1"))
+            .unwrap()
+            .sample_index(),
+        1
+    );
 
     let decode = control.schedule().unwrap().unwrap();
     assert_eq!(decode.step_id, BatchId(1));
     assert_eq!(decode.requests[0].input_token_ids, vec![31]);
     assert_eq!(decode.requests[0].work_type, WorkType::Decode);
     assert_eq!(decode.requests[0].start_position, 3);
+    assert_eq!(
+        decode.requests[0]
+            .sampling_plan
+            .as_ref()
+            .unwrap()
+            .sample_index,
+        1
+    );
 }
 
 #[test]
@@ -349,6 +402,7 @@ fn chunked_prefill_samples_only_on_final_chunk() {
         assert_eq!(batch.requests[0].input_token_ids, tokens);
         assert_eq!(batch.requests[0].start_position, start);
         assert_eq!(batch.requests[0].need_sample, need_sample);
+        assert_eq!(batch.requests[0].sampling_plan.is_some(), need_sample);
         control.apply_result(fake_result(&batch)).unwrap();
     }
     let request = control.request(&id).unwrap();
@@ -391,6 +445,7 @@ fn executor_failure_fails_batch_releases_cache_and_continues() {
                 request_id: request_id.clone(),
                 prompt_token_ids: vec![index as i64 * 10 + 1, index as i64 * 10 + 2],
                 max_new_len: 2,
+                sampling_params: einf_control::SamplingParams::default(),
             })
             .unwrap();
     }

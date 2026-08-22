@@ -11,13 +11,11 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from einf.cache.manager import KVCacheManager
-from einf.cache.pool import BlockPool
 from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
 from einf.executors.torch import QwenConfig, QwenModelRunner, TorchExecutor
 from einf.lib import LLMServer
 from einf.request import RequestSpec, RequestState
-from einf.scheduler import FCFSPolicy, Scheduler
+from einf.scheduler import Scheduler
 
 
 DEFAULT_MODEL_DIR = Path("/home/wyg/python/models/Qwen2.5-0.5B")
@@ -102,7 +100,7 @@ def run_request(
         torch.cuda.synchronize()
         steps += 1
 
-        request = scheduler._get_request(request_id)
+        request = scheduler.request(request_id)
         if first_token_time is None and request.generated_token_ids:
             first_token_time = time.perf_counter()
 
@@ -210,8 +208,9 @@ def main() -> None:
     load_seconds = time.perf_counter() - load_start
 
     scheduler = Scheduler(
-        FCFSPolicy(),
-        KVCacheManager(BlockPool(num_blocks), args.block_len),
+        policy="fcfs",
+        num_blocks=num_blocks,
+        block_len=args.block_len,
         max_batch_len=max_batch_len,
         max_prefill_chunk_len=prefill_chunk_len,
     )

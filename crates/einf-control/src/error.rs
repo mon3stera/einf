@@ -31,8 +31,11 @@ pub enum ControlError {
         expected: BatchId,
         actual: BatchId,
     },
+    UnsealedBlock(BlockId),
+    InvalidSeal(BlockId),
     InvalidExecutionResult(String),
     RequestInFlight(RequestId),
+    InvalidReusePlan(String),
 }
 
 impl fmt::Display for ControlError {
@@ -69,6 +72,9 @@ impl fmt::Display for ControlError {
                 write!(f, "invalid execution result: {message}")
             }
             Self::RequestInFlight(id) => write!(f, "request is in flight: {id}"),
+            Self::UnsealedBlock(id) => write!(f, "unsealed block: {id}"),
+            Self::InvalidSeal(id) => write!(f, "cannot seal: {id}"),
+            Self::InvalidReusePlan(reason) => write!(f, "invalid reuse plan: {reason}"),
         }
     }
 }

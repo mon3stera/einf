@@ -1,16 +1,9 @@
-from dataclasses import FrozenInstanceError
-
 import pytest
 
-from einf.execution_plan import (
-    BatchPlan,
-    ScheduledBatch,
-    ScheduledRequest,
-    WorkType,
-)
+from einf.execution_plan import BatchPlan, ScheduledBatch, ScheduledRequest, WorkType
 
 
-def test_batch_plan_is_immutable_and_compatible_with_scheduled_batch() -> None:
+def test_batch_plan_is_native_immutable_and_aliased() -> None:
     request = ScheduledRequest(
         request_id="req-1",
         input_token_ids=(1, 2),
@@ -21,14 +14,15 @@ def test_batch_plan_is_immutable_and_compatible_with_scheduled_batch() -> None:
     )
     plan = BatchPlan(step_id=4, requests=(request,))
 
+    assert ScheduledBatch is BatchPlan
     assert isinstance(plan, ScheduledBatch)
-    assert plan.requests[0].block_table == (3,)
+    assert plan.requests[0].block_table == [3]
 
-    with pytest.raises(FrozenInstanceError):
-        plan.step_id = 5  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        plan.step_id = 5
 
 
-def test_execution_plan_uses_typed_work_kind() -> None:
+def test_execution_plan_uses_singleton_work_kind() -> None:
     assert WorkType.PREFILL is not WorkType.DECODE
     assert ScheduledRequest(
         request_id="req-1",

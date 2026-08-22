@@ -11,3 +11,5 @@ name = "einf_control"
 path = "src/lib.rs"
 
 [dependencies]
+bytemuck = "1"
+sha2 = "0.10"

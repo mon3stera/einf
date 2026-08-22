@@ -1,5 +1,3 @@
-from einf.cache.manager import KVCacheManager
-from einf.cache.pool import BlockPool
 from einf.execution import (
     ExecutionResult,
     Executor,
@@ -9,9 +7,6 @@ from einf.executors import FakeExecutor
 from einf.lib import LLMServer
 from einf.request import CompletionReason, RequestSpec, RequestState
 from einf.scheduler import (
-    DecodeFirstPolicy,
-    FCFSPolicy,
-    Policy,
     ScheduledBatch,
     ScheduledRequest,
     Scheduler,
@@ -25,20 +20,15 @@ def make_scheduler(
     block_len: int = 4,
     max_batch_len: int = 8,
     max_prefill_chunk_len: int = 8,
-    policy: Policy | None = None,
-) -> tuple[Scheduler, KVCacheManager, BlockPool]:
-    pool = BlockPool(num_blocks=num_blocks)
-    cache_manager = KVCacheManager(
-        pool,
+    policy: str = "fcfs",
+) -> Scheduler:
+    return Scheduler(
+        policy=policy,
+        num_blocks=num_blocks,
         block_len=block_len,
-    )
-    scheduler = Scheduler(
-        policy if policy is not None else FCFSPolicy(),
-        cache_manager,
         max_batch_len=max_batch_len,
         max_prefill_chunk_len=max_prefill_chunk_len,
     )
-    return scheduler, cache_manager, pool
 
 
 def test_fake_executor_returns_one_result_per_scheduled_request() -> None:
@@ -86,7 +76,7 @@ def test_fake_executor_returns_one_result_per_scheduled_request() -> None:
 
 
 def test_schedule_builds_dynamic_batch_from_token_budget() -> None:
-    scheduler, _, _ = make_scheduler(
+    scheduler = make_scheduler(
         block_len=2,
         max_batch_len=2,
     )
@@ -131,7 +121,7 @@ def test_schedule_builds_dynamic_batch_from_token_budget() -> None:
 
 
 def test_schedule_grows_block_table_when_decode_crosses_block_boundary() -> None:
-    scheduler, cache_manager, _ = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=2,
         block_len=4,
         max_batch_len=4,
@@ -148,23 +138,23 @@ def test_schedule_grows_block_table_when_decode_crosses_block_boundary() -> None
     prefill_batch = scheduler.schedule()
     assert prefill_batch is not None
     prefill = prefill_batch.requests[0]
-    assert prefill.input_token_ids == (10, 20, 30, 40)
+    assert prefill.input_token_ids == [10, 20, 30, 40]
     assert prefill.start_position == 0
-    assert prefill.block_table == (0,)
+    assert prefill.block_table == [0]
 
     scheduler.apply_result(executor.execute(prefill_batch))
 
     decode_batch = scheduler.schedule()
     assert decode_batch is not None
     decode = decode_batch.requests[0]
-    assert decode.input_token_ids == (41,)
+    assert decode.input_token_ids == [41]
     assert decode.start_position == 4
-    assert decode.block_table == (0, 1)
-    assert cache_manager.translate(request_id, 4) == (1, 0)
+    assert decode.block_table == [0, 1]
+    assert scheduler.block_table(request_id)[1] == 1
 
 
 def test_server_runs_multiple_requests_and_releases_cache() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=3,
         block_len=2,
         max_batch_len=3,
@@ -187,8 +177,8 @@ def test_server_runs_multiple_requests_and_releases_cache() -> None:
 
     server.run_until_idle()
 
-    first = scheduler._get_request(first_id)
-    second = scheduler._get_request(second_id)
+    first = scheduler.request(first_id)
+    second = scheduler.request(second_id)
 
     assert first.state is RequestState.FINISHED
     assert first.generated_token_ids == [21, 22]
@@ -200,14 +190,14 @@ def test_server_runs_multiple_requests_and_releases_cache() -> None:
     assert second.cached_len == 2
     assert second.completion_reason is CompletionReason.LENGTH
 
-    assert cache_manager.block_table(first_id) == ()
-    assert cache_manager.block_table(second_id) == ()
-    assert pool.free_len() == 3
-    assert len(scheduler._policy) == 0
+    assert scheduler.block_table(first_id) == []
+    assert scheduler.block_table(second_id) == []
+    assert scheduler.free_blocks() == 3
+    assert len(scheduler.running_ids()) == 0
 
 
 def test_eos_wins_when_eos_and_length_happen_together() -> None:
-    scheduler, cache_manager, pool = make_scheduler(num_blocks=1)
+    scheduler = make_scheduler(num_blocks=1)
     request_id = scheduler.submit(
         RequestSpec(
             request_id="req-1",
@@ -232,22 +222,22 @@ def test_eos_wins_when_eos_and_length_happen_together() -> None:
         )
     )
 
-    request = scheduler._get_request(request_id)
+    request = scheduler.request(request_id)
     assert request.state is RequestState.FINISHED
     assert request.completion_reason is CompletionReason.EOS
-    assert cache_manager.block_table(request_id) == ()
-    assert pool.free_len() == 1
-    assert len(scheduler._policy) == 0
+    assert scheduler.block_table(request_id) == []
+    assert scheduler.free_blocks() == 1
+    assert len(scheduler.running_ids()) == 0
 
 
 
 def test_decode_first_prioritizes_decode_over_earlier_prefill() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=5,
         block_len=2,
         max_batch_len=3,
         max_prefill_chunk_len=2,
-        policy=DecodeFirstPolicy(),
+        policy="decode_first",
     )
     prefill_id = scheduler.submit(
         RequestSpec(
@@ -292,8 +282,8 @@ def test_decode_first_prioritizes_decode_over_earlier_prefill() -> None:
         WorkType.PREFILL,
     ]
     assert [request.input_token_ids for request in second_batch.requests] == [
-        (101,),
-        (30, 40),
+        [101],
+        [30, 40],
     ]
     scheduler.apply_result(executor.execute(second_batch))
 
@@ -304,8 +294,8 @@ def test_decode_first_prioritizes_decode_over_earlier_prefill() -> None:
         prefill_id,
     ]
     assert [request.input_token_ids for request in third_batch.requests] == [
-        (102,),
-        (50,),
+        [102],
+        [50],
     ]
     assert [request.need_sample for request in third_batch.requests] == [
         True,
@@ -313,24 +303,24 @@ def test_decode_first_prioritizes_decode_over_earlier_prefill() -> None:
     ]
     scheduler.apply_result(executor.execute(third_batch))
 
-    decode = scheduler._get_request(decode_id)
-    prefill = scheduler._get_request(prefill_id)
+    decode = scheduler.request(decode_id)
+    prefill = scheduler.request(prefill_id)
     assert decode.state is RequestState.FINISHED
     assert decode.generated_token_ids == [101, 102, 103]
     assert prefill.state is RequestState.FINISHED
     assert prefill.generated_token_ids == [51]
-    assert cache_manager.block_table(decode_id) == ()
-    assert cache_manager.block_table(prefill_id) == ()
-    assert pool.free_len() == 5
+    assert scheduler.block_table(decode_id) == []
+    assert scheduler.block_table(prefill_id) == []
+    assert scheduler.free_blocks() == 5
 
 
 def test_new_waiting_request_joins_existing_decode_next_iteration() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=4,
         block_len=2,
         max_batch_len=3,
         max_prefill_chunk_len=2,
-        policy=DecodeFirstPolicy(),
+        policy="decode_first",
     )
     decode_id = scheduler.submit(
         RequestSpec(
@@ -353,7 +343,7 @@ def test_new_waiting_request_joins_existing_decode_next_iteration() -> None:
             max_new_len=1,
         )
     )
-    assert scheduler._get_request(prefill_id).state is RequestState.WAITING
+    assert scheduler.request(prefill_id).state is RequestState.WAITING
 
     mixed_batch = scheduler.schedule()
     assert mixed_batch is not None
@@ -366,8 +356,8 @@ def test_new_waiting_request_joins_existing_decode_next_iteration() -> None:
         WorkType.PREFILL,
     ]
     assert [request.input_token_ids for request in mixed_batch.requests] == [
-        (101,),
-        (10, 20),
+        [101],
+        [10, 20],
     ]
     assert mixed_batch.requests[1].need_sample is False
     scheduler.apply_result(executor.execute(mixed_batch))
@@ -379,25 +369,25 @@ def test_new_waiting_request_joins_existing_decode_next_iteration() -> None:
         prefill_id,
     ]
     assert [request.input_token_ids for request in final_batch.requests] == [
-        (102,),
-        (30, 40),
+        [102],
+        [30, 40],
     ]
     assert final_batch.requests[1].need_sample is True
     scheduler.apply_result(executor.execute(final_batch))
 
-    decode = scheduler._get_request(decode_id)
-    prefill = scheduler._get_request(prefill_id)
+    decode = scheduler.request(decode_id)
+    prefill = scheduler.request(prefill_id)
     assert decode.state is RequestState.FINISHED
     assert decode.generated_token_ids == [101, 102, 103]
     assert prefill.state is RequestState.FINISHED
     assert prefill.generated_token_ids == [41]
-    assert cache_manager.block_table(decode_id) == ()
-    assert cache_manager.block_table(prefill_id) == ()
-    assert pool.free_len() == 4
+    assert scheduler.block_table(decode_id) == []
+    assert scheduler.block_table(prefill_id) == []
+    assert scheduler.free_blocks() == 4
 
 
 def test_chunked_prefill_samples_only_after_final_chunk() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=3,
         block_len=2,
         max_batch_len=2,
@@ -416,51 +406,53 @@ def test_chunked_prefill_samples_only_after_final_chunk() -> None:
     assert first_batch is not None
     first_chunk = first_batch.requests[0]
     assert first_chunk.work_type is WorkType.PREFILL
-    assert first_chunk.input_token_ids == (10, 20)
+    assert first_chunk.input_token_ids == [10, 20]
     assert first_chunk.start_position == 0
     assert first_chunk.need_sample is False
 
     first_result = executor.execute(first_batch)
-    assert first_result.request_results[0].generated_token_ids == ()
+    assert first_result.request_results[0].generated_token_ids == []
     scheduler.apply_result(first_result)
-    request = scheduler._get_request(request_id)
+    request = scheduler.request(request_id)
     assert request.cached_len == 2
     assert request.generated_token_ids == []
 
     second_batch = scheduler.schedule()
     assert second_batch is not None
     second_chunk = second_batch.requests[0]
-    assert second_chunk.input_token_ids == (30, 40)
+    assert second_chunk.input_token_ids == [30, 40]
     assert second_chunk.start_position == 2
     assert second_chunk.need_sample is False
 
     second_result = executor.execute(second_batch)
-    assert second_result.request_results[0].generated_token_ids == ()
+    assert second_result.request_results[0].generated_token_ids == []
     scheduler.apply_result(second_result)
+    request = scheduler.request(request_id)
     assert request.cached_len == 4
     assert request.generated_token_ids == []
 
     final_batch = scheduler.schedule()
     assert final_batch is not None
     final_chunk = final_batch.requests[0]
-    assert final_chunk.input_token_ids == (50,)
+    assert final_chunk.input_token_ids == [50]
     assert final_chunk.start_position == 4
     assert final_chunk.need_sample is True
 
     final_result = executor.execute(final_batch)
-    assert final_result.request_results[0].generated_token_ids == (51,)
+    assert final_result.request_results[0].generated_token_ids == [51]
     scheduler.apply_result(final_result)
 
+    request = scheduler.request(request_id)
     assert request.state is RequestState.FINISHED
     assert request.generated_token_ids == [51]
     assert request.cached_len == 5
     assert request.completion_reason is CompletionReason.LENGTH
-    assert cache_manager.block_table(request_id) == ()
-    assert pool.free_len() == 3
+    assert scheduler.block_table(request_id) == []
+    assert scheduler.free_blocks() == 3
 
 
 def test_waiting_cancel_is_skipped_before_admission() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=1,
         block_len=2,
         max_batch_len=2,
@@ -485,15 +477,15 @@ def test_waiting_cancel_is_skipped_before_admission() -> None:
 
     assert batch is not None
     assert [request.request_id for request in batch.requests] == [live_id]
-    assert scheduler._get_request(cancelled_id).state is RequestState.CANCELLED
-    assert cache_manager.block_table(cancelled_id) == ()
+    assert scheduler.request(cancelled_id).state is RequestState.CANCELLED
+    assert scheduler.block_table(cancelled_id) == []
 
     scheduler.apply_result(FakeExecutor().execute(batch))
-    assert pool.free_len() == 1
+    assert scheduler.free_blocks() == 1
 
 
 def test_running_cancel_releases_cache_and_skips_stale_policy_entry() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=1,
         block_len=2,
         max_batch_len=2,
@@ -510,13 +502,13 @@ def test_running_cancel_releases_cache_and_skips_stale_policy_entry() -> None:
     first_batch = scheduler.schedule()
     assert first_batch is not None
     scheduler.apply_result(executor.execute(first_batch))
-    assert cache_manager.block_table(request_id) == (0,)
+    assert scheduler.block_table(request_id) == [0]
 
     scheduler.cancel(request_id)
 
-    assert scheduler._get_request(request_id).state is RequestState.CANCELLED
-    assert cache_manager.block_table(request_id) == ()
-    assert pool.free_len() == 1
+    assert scheduler.request(request_id).state is RequestState.CANCELLED
+    assert scheduler.block_table(request_id) == []
+    assert scheduler.free_blocks() == 1
     assert scheduler.schedule() is None
 
 
@@ -527,7 +519,7 @@ class FailingExecutor(Executor):
 
 
 def test_executor_failure_fails_batch_releases_cache_and_continues() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=2,
         block_len=2,
         max_batch_len=4,
@@ -549,30 +541,30 @@ def test_executor_failure_fails_batch_releases_cache_and_continues() -> None:
     assert server.run_once() is True
 
     for request_id in request_ids[:2]:
-        request = scheduler._get_request(request_id)
+        request = scheduler.request(request_id)
         assert request.state is RequestState.FAILED
         assert request.error == "RuntimeError: injected execution failure"
-        assert cache_manager.block_table(request_id) == ()
+        assert scheduler.block_table(request_id) == []
 
-    assert scheduler._get_request(request_ids[2]).state is RequestState.WAITING
-    assert pool.free_len() == 2
+    assert scheduler.request(request_ids[2]).state is RequestState.WAITING
+    assert scheduler.free_blocks() == 2
 
     assert server.run_once() is True
-    last_request = scheduler._get_request(request_ids[2])
+    last_request = scheduler.request(request_ids[2])
     assert last_request.state is RequestState.FAILED
     assert last_request.error == "RuntimeError: injected execution failure"
-    assert cache_manager.block_table(request_ids[2]) == ()
-    assert pool.free_len() == 2
+    assert scheduler.block_table(request_ids[2]) == []
+    assert scheduler.free_blocks() == 2
     assert server.run_once() is False
 
 
 def test_single_request_cache_requirement_beyond_capacity_fails() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=1,
         block_len=2,
         max_batch_len=2,
         max_prefill_chunk_len=2,
-        policy=FCFSPolicy(),
+        policy="fcfs",
     )
     server = LLMServer(scheduler, FakeExecutor())
     request_id = scheduler.submit(
@@ -586,22 +578,22 @@ def test_single_request_cache_requirement_beyond_capacity_fails() -> None:
     assert server.run_once() is True
     assert server.run_once() is False
 
-    request = scheduler._get_request(request_id)
+    request = scheduler.request(request_id)
     assert request.state is RequestState.FAILED
     assert request.error == "Insufficient memory to fulfill request too-large"
-    assert cache_manager.block_table(request_id) == ()
-    assert len(scheduler._policy) == 0
-    assert list(scheduler._waiting) == []
-    assert pool.free_len() == 1
+    assert scheduler.block_table(request_id) == []
+    assert len(scheduler.running_ids()) == 0
+    assert scheduler.waiting_ids() == []
+    assert scheduler.free_blocks() == 1
 
 
 def test_fcfs_preemption_keeps_older_request_running() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=2,
         block_len=2,
         max_batch_len=4,
         max_prefill_chunk_len=2,
-        policy=FCFSPolicy(),
+        policy="fcfs",
     )
     executor = FakeExecutor()
     older_id = scheduler.submit(
@@ -630,17 +622,17 @@ def test_fcfs_preemption_keeps_older_request_running() -> None:
     second_batch = scheduler.schedule()
     assert second_batch is not None
     assert [item.request_id for item in second_batch.requests] == [older_id]
-    assert scheduler._get_request(newer_id).state is RequestState.WAITING
-    assert cache_manager.block_table(newer_id) == ()
-    assert [item.request_id for item in scheduler._waiting] == [newer_id]
-    assert [item.request_id for item in scheduler._policy.candidates()] == [
+    assert scheduler.request(newer_id).state is RequestState.WAITING
+    assert scheduler.block_table(newer_id) == []
+    assert scheduler.waiting_ids() == [newer_id]
+    assert scheduler.running_ids() == [
         older_id
     ]
 
     scheduler.apply_result(executor.execute(second_batch))
-    assert scheduler._get_request(older_id).state is RequestState.FINISHED
-    assert cache_manager.block_table(older_id) == ()
-    assert pool.free_len() == 2
+    assert scheduler.request(older_id).state is RequestState.FINISHED
+    assert scheduler.block_table(older_id) == []
+    assert scheduler.free_blocks() == 2
 
     recompute_batch = scheduler.schedule()
     assert recompute_batch is not None
@@ -648,12 +640,12 @@ def test_fcfs_preemption_keeps_older_request_running() -> None:
     recompute = recompute_batch.requests[0]
     assert recompute.request_id == newer_id
     assert recompute.work_type is WorkType.PREFILL
-    assert recompute.input_token_ids == (30, 40)
+    assert recompute.input_token_ids == [30, 40]
     assert recompute.start_position == 0
     assert recompute.need_sample is False
 
     scheduler.apply_result(executor.execute(recompute_batch))
-    newer = scheduler._get_request(newer_id)
+    newer = scheduler.request(newer_id)
     assert newer.state is RequestState.RUNNING
     assert newer.cached_len == 2
     assert newer.generated_token_ids == [41]
@@ -664,28 +656,29 @@ def test_fcfs_preemption_keeps_older_request_running() -> None:
     resumed_decode = resumed_decode_batch.requests[0]
     assert resumed_decode.request_id == newer_id
     assert resumed_decode.work_type is WorkType.DECODE
-    assert resumed_decode.input_token_ids == (41,)
+    assert resumed_decode.input_token_ids == [41]
     assert resumed_decode.start_position == 2
     assert resumed_decode.need_sample is True
 
     scheduler.apply_result(executor.execute(resumed_decode_batch))
+    newer = scheduler.request(newer_id)
     assert newer.state is RequestState.FINISHED
     assert newer.completion_reason is CompletionReason.LENGTH
     assert newer.cached_len == 3
     assert newer.generated_token_ids == [41, 42]
-    assert cache_manager.block_table(newer_id) == ()
-    assert len(scheduler._policy) == 0
-    assert list(scheduler._waiting) == []
-    assert pool.free_len() == 2
+    assert scheduler.block_table(newer_id) == []
+    assert len(scheduler.running_ids()) == 0
+    assert scheduler.waiting_ids() == []
+    assert scheduler.free_blocks() == 2
 
 
 def test_decode_first_preempts_prefill_before_decode() -> None:
-    scheduler, cache_manager, pool = make_scheduler(
+    scheduler = make_scheduler(
         num_blocks=2,
         block_len=2,
         max_batch_len=4,
         max_prefill_chunk_len=2,
-        policy=DecodeFirstPolicy(),
+        policy="decode_first",
     )
     executor = FakeExecutor()
     prefill_id = scheduler.submit(
@@ -716,28 +709,25 @@ def test_decode_first_preempts_prefill_before_decode() -> None:
     assert [item.need_sample for item in first_batch.requests] == [False, True]
     scheduler.apply_result(executor.execute(first_batch))
 
-    assert [item.request_id for item in scheduler._policy.candidates()] == [
-        decode_id,
-        prefill_id,
-    ]
+    assert set(scheduler.running_ids()) == {decode_id, prefill_id}
 
     decode_batch = scheduler.schedule()
     assert decode_batch is not None
     assert [item.request_id for item in decode_batch.requests] == [decode_id]
     assert decode_batch.requests[0].work_type is WorkType.DECODE
-    assert scheduler._get_request(prefill_id).state is RequestState.WAITING
-    assert scheduler._get_request(prefill_id).cached_len == 0
-    assert cache_manager.block_table(prefill_id) == ()
-    assert [item.request_id for item in scheduler._waiting] == [prefill_id]
-    assert [item.request_id for item in scheduler._policy.candidates()] == [
+    assert scheduler.request(prefill_id).state is RequestState.WAITING
+    assert scheduler.request(prefill_id).cached_len == 0
+    assert scheduler.block_table(prefill_id) == []
+    assert scheduler.waiting_ids() == [prefill_id]
+    assert scheduler.running_ids() == [
         decode_id
     ]
 
     scheduler.apply_result(executor.execute(decode_batch))
-    decode = scheduler._get_request(decode_id)
+    decode = scheduler.request(decode_id)
     assert decode.state is RequestState.FINISHED
     assert decode.generated_token_ids == [21, 22]
-    assert cache_manager.block_table(decode_id) == ()
+    assert scheduler.block_table(decode_id) == []
 
     first_recompute_batch = scheduler.schedule()
     assert first_recompute_batch is not None
@@ -745,7 +735,7 @@ def test_decode_first_preempts_prefill_before_decode() -> None:
     first_recompute = first_recompute_batch.requests[0]
     assert first_recompute.request_id == prefill_id
     assert first_recompute.work_type is WorkType.PREFILL
-    assert first_recompute.input_token_ids == (30, 40)
+    assert first_recompute.input_token_ids == [30, 40]
     assert first_recompute.start_position == 0
     assert first_recompute.need_sample is False
     scheduler.apply_result(executor.execute(first_recompute_batch))
@@ -756,17 +746,17 @@ def test_decode_first_preempts_prefill_before_decode() -> None:
     final_prefill = final_prefill_batch.requests[0]
     assert final_prefill.request_id == prefill_id
     assert final_prefill.work_type is WorkType.PREFILL
-    assert final_prefill.input_token_ids == (50, 60)
+    assert final_prefill.input_token_ids == [50, 60]
     assert final_prefill.start_position == 2
     assert final_prefill.need_sample is True
     scheduler.apply_result(executor.execute(final_prefill_batch))
 
-    prefill = scheduler._get_request(prefill_id)
+    prefill = scheduler.request(prefill_id)
     assert prefill.state is RequestState.FINISHED
     assert prefill.completion_reason is CompletionReason.LENGTH
     assert prefill.cached_len == 4
     assert prefill.generated_token_ids == [61]
-    assert cache_manager.block_table(prefill_id) == ()
-    assert len(scheduler._policy) == 0
-    assert list(scheduler._waiting) == []
-    assert pool.free_len() == 2
+    assert scheduler.block_table(prefill_id) == []
+    assert len(scheduler.running_ids()) == 0
+    assert scheduler.waiting_ids() == []
+    assert scheduler.free_blocks() == 2

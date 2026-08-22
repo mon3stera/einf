@@ -6,13 +6,11 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from einf.cache.manager import KVCacheManager
-from einf.cache.pool import BlockPool
 from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
 from einf.executors.torch import QwenConfig, QwenModelRunner, TorchExecutor
 from einf.lib import LLMServer
 from einf.request import RequestSpec, RequestState
-from einf.scheduler import FCFSPolicy, Scheduler
+from einf.scheduler import Scheduler
 
 
 DEFAULT_MODEL_DIR = Path("/home/wyg/python/models/Qwen2.5-0.5B")
@@ -78,8 +76,9 @@ def main() -> None:
     runner.load_checkpoint(model_dir / "model.safetensors")
 
     scheduler = Scheduler(
-        FCFSPolicy(),
-        KVCacheManager(BlockPool(args.num_blocks), args.block_len),
+        policy="fcfs",
+        num_blocks=args.num_blocks,
+        block_len=args.block_len,
         max_batch_len=args.max_batch_len,
         max_prefill_chunk_len=args.max_prefill_chunk_len,
     )
@@ -101,7 +100,7 @@ def main() -> None:
     with torch.inference_mode():
         server.run_until_idle()
 
-    request = scheduler._get_request(request_id)
+    request = scheduler.request(request_id)
     if request.state is RequestState.FAILED:
         raise RuntimeError(request.error)
 

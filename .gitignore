@@ -8,3 +8,6 @@ build/
 dist/
 *.egg-info/
 benchmark-results/
+target/
+*.so
+third_party/

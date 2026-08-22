@@ -30,6 +30,7 @@ fn spec(id: &str, prompt: &[i64], max_new_len: usize) -> RequestSpec {
         request_id: RequestId::from(id),
         prompt_token_ids: prompt.to_vec(),
         max_new_len,
+        sampling_params: einf_control::SamplingParams::default(),
     }
 }
 
@@ -79,9 +80,9 @@ fn request_lifecycle_matches_python_baseline() {
 #[test]
 fn block_pool_and_kv_allocation_are_all_or_nothing() {
     let mut cache = KvCacheManager::new(2, 4).unwrap();
-    cache.reserve_to(RequestId::from("req-1"), 5).unwrap();
+    cache.reserve_to(RequestId::from("req-1"), None, 5).unwrap();
     assert_eq!(cache.block_table(RequestId::from("req-1")).len(), 2);
-    assert!(cache.reserve_to(RequestId::from("req-1"), 9).is_err());
+    assert!(cache.reserve_to(RequestId::from("req-1"), None, 9).is_err());
     assert_eq!(cache.block_table(RequestId::from("req-1")).len(), 2);
     cache.release(RequestId::from("req-1")).unwrap();
     assert_eq!(cache.free_blocks(), 2);

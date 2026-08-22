@@ -3,11 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::error::ControlError;
 use crate::execution::{BatchId, ExecutionResult};
 use crate::execution_plan::{BatchPlan, ScheduledRequest, WorkType};
-use crate::kv_cache::KvCacheManager;
+use crate::kv_cache::{KvCacheManager, ReusePlan};
 use crate::policy::{PolicyRequest, SchedulingPolicy};
 use crate::request::{
     AdvanceResult, CompletionReason, Request, RequestId, RequestSpec, RequestState,
 };
+use crate::sample::SamplingPlan;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulerConfig {
@@ -136,12 +137,14 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             })
             .cloned()
             .collect::<Vec<_>>();
+
         ids.sort_by(|left, right| {
             self.policy.compare(
                 &self.policy_request(self.requests.get(left).expect("running request")),
                 &self.policy_request(self.requests.get(right).expect("running request")),
             )
         });
+
         ids
     }
 
@@ -173,23 +176,45 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         self.cache.release(id.clone())
     }
 
+    fn prepare_schedule_context(
+        &self,
+        request: &Request,
+        plan: &Option<ReusePlan>,
+    ) -> (usize, Vec<i64>, WorkType) {
+        match plan {
+            Some(plan) => {
+                let start = plan.reused_len();
+                let context = request.context_token_ids();
+                let work_type = WorkType::Prefill;
+                (start, context, work_type)
+            }
+            None => (
+                request.cached_len(),
+                request.context_token_ids(),
+                Self::work_type(request),
+            ),
+        }
+    }
+
     fn schedule_one(
         &mut self,
         id: &RequestId,
+        plan: Option<ReusePlan>,
         remaining: usize,
     ) -> Result<Option<(ScheduledRequest, usize)>, ControlError> {
         let request = self
             .requests
             .get(id)
             .ok_or_else(|| ControlError::UnknownRequest(id.clone()))?;
-        let start = request.cached_len();
-        let context = request.context_token_ids();
-        let work_type = Self::work_type(request);
+
+        let (start, context, work_type) = self.prepare_schedule_context(request, &plan);
+
         let pending = if work_type == WorkType::Prefill {
             context.len().saturating_sub(start)
         } else {
             1
         };
+
         let scheduled_len = if work_type == WorkType::Prefill {
             self.config
                 .max_prefill_chunk_len
@@ -198,9 +223,11 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         } else {
             1.min(remaining)
         };
+
         if scheduled_len == 0 {
             return Ok(None);
         }
+
         if start
             .checked_add(scheduled_len)
             .map_or(true, |end| end > context.len())
@@ -209,16 +236,24 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 "decode request has no input token".into(),
             ));
         }
+
         let required = start
             .checked_add(scheduled_len)
             .ok_or(ControlError::ArithmeticOverflow)?;
+
         let table = self
             .cache
-            .reserve_to(id.clone(), required)?
+            .reserve_to(id.clone(), plan, required)?
             .blocks()
             .to_vec();
+
         let input = context[start..start + scheduled_len].to_vec();
         let need_sample = scheduled_len == pending;
+        let sampling_plan = need_sample.then(|| SamplingPlan {
+            params: request.sampling_params().clone(),
+            sample_index: request.sample_index(),
+        });
+
         Ok(Some((
             ScheduledRequest {
                 request_id: id.clone(),
@@ -227,6 +262,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 start_position: start,
                 block_table: table,
                 need_sample,
+                sampling_plan,
             },
             scheduled_len,
         )))
@@ -240,7 +276,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         selected: &mut Vec<ScheduledRequest>,
     ) -> Result<usize, ControlError> {
         loop {
-            match self.schedule_one(id, remaining) {
+            match self.schedule_one(id, None, remaining) {
                 Ok(Some((item, used))) => {
                     selected.push(item);
                     return Ok(used);
@@ -295,6 +331,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             let Some(id) = self.waiting.front().cloned() else {
                 break;
             };
+
             if self
                 .requests
                 .get(&id)
@@ -303,13 +340,30 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 self.waiting.pop_front();
                 continue;
             }
-            match self.schedule_one(&id, remaining) {
+
+            let request = self
+                .requests
+                .get(&id)
+                .ok_or_else(|| ControlError::UnknownRequest(id.clone()))?;
+
+            let plan = self.cache.plan_reuse(&request.prompt_token_ids());
+            let reused_len = match &plan {
+                Some(plan) => plan.reused_len(),
+                None => 0,
+            };
+
+            match self.schedule_one(&id, plan, remaining) {
                 Ok(Some((item, used))) => {
                     self.waiting.pop_front();
-                    self.requests
-                        .get_mut(&id)
-                        .expect("waiting request")
-                        .admit()?;
+
+                    let request = self.requests.get_mut(&id).expect("waiting request");
+
+                    request.admit()?;
+
+                    if reused_len != 0 {
+                        request.reuse(reused_len)?;
+                    }
+
                     self.running.push(id.clone());
                     selected.push(item);
                     remaining -= used;
@@ -345,11 +399,25 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         Err(error)
     }
 
+    fn seal_blocks(
+        cache: &mut KvCacheManager,
+        request: &Request,
+        old_cached_len: usize,
+    ) -> Result<(), ControlError> {
+        let sealed_len = (old_cached_len / cache.block_len()) * cache.block_len();
+        let context = request.context_token_ids();
+        let seal_end = (request.cached_len() / cache.block_len()) * cache.block_len();
+        let need_seal_tokens = &context[sealed_len..seal_end];
+        cache.seal_blocks(request.request_id(), need_seal_tokens, sealed_len)?;
+        Ok(())
+    }
+
     pub fn apply_result(&mut self, result: ExecutionResult) -> Result<(), ControlError> {
         let plan = self
             .outstanding
             .take()
             .ok_or(ControlError::NoOutstandingBatch)?;
+
         if result.step_id != plan.step_id {
             return self.reject_result(
                 &plan,
@@ -359,6 +427,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 },
             );
         }
+
         if result.request_results.len() != plan.requests.len() {
             return self.reject_result(
                 &plan,
@@ -367,6 +436,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         }
 
         let mut seen = BTreeSet::new();
+
         for item in &result.request_results {
             if !seen.insert(item.request_id.clone()) {
                 return self.reject_result(
@@ -374,6 +444,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     ControlError::InvalidExecutionResult("duplicate request result".into()),
                 );
             }
+
             let Some(scheduled) = plan
                 .requests
                 .iter()
@@ -384,16 +455,19 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     ControlError::InvalidExecutionResult("unknown request result".into()),
                 );
             };
+
             if item.cached_len_delta != scheduled.input_token_ids.len() {
                 return self.reject_result(
                     &plan,
                     ControlError::InvalidExecutionResult("cached length delta mismatch".into()),
                 );
             }
+
             let Some(request) = self.requests.get(&item.request_id) else {
                 return self
                     .reject_result(&plan, ControlError::UnknownRequest(item.request_id.clone()));
             };
+
             if request.state() != RequestState::Running {
                 return self.reject_result(
                     &plan,
@@ -404,6 +478,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     },
                 );
             }
+
             let Some(generated_len) = request
                 .generated_token_ids()
                 .len()
@@ -411,6 +486,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             else {
                 return self.reject_result(&plan, ControlError::ArithmeticOverflow);
             };
+
             if generated_len > request.max_new_len() {
                 return self.reject_result(
                     &plan,
@@ -419,16 +495,54 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                     ),
                 );
             }
+
+            if item.generated_token_ids.len() > 1 {
+                return self.reject_result(
+                    &plan,
+                    ControlError::InvalidExecutionResult(
+                        "execution result generated more than one token".into(),
+                    ),
+                );
+            }
+
+            if scheduled.need_sample != scheduled.sampling_plan.is_some() {
+                return self.reject_result(
+                    &plan,
+                    ControlError::InvalidExecutionResult(
+                        "sampling plan does not match need_sample".into(),
+                    ),
+                );
+            }
+            if item.generated_token_ids.is_empty() != !scheduled.need_sample {
+                return self.reject_result(
+                    &plan,
+                    ControlError::InvalidExecutionResult(
+                        "generated token presence does not match sampling plan".into(),
+                    ),
+                );
+            }
+            if let Some(sampling_plan) = &scheduled.sampling_plan {
+                if sampling_plan.sample_index != request.sample_index() {
+                    return self.reject_result(
+                        &plan,
+                        ControlError::InvalidExecutionResult(
+                            "sampling plan index does not match request".into(),
+                        ),
+                    );
+                }
+            }
         }
 
         // Validate the complete result before mutating any request or cache state.
         let mut staged_requests = self.requests.clone();
         let mut staged_cache = self.cache.clone();
         let mut staged_running = self.running.clone();
+
         for item in result.request_results {
             let request = staged_requests
                 .get_mut(&item.request_id)
                 .expect("validated request result");
+
             let reason = if item.is_eos {
                 Some(CompletionReason::Eos)
             } else if request.generated_token_ids().len() + item.generated_token_ids.len()
@@ -438,6 +552,9 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             } else {
                 None
             };
+
+            let old_cached_len = request.cached_len();
+
             if let Err(error) = request.advance(AdvanceResult {
                 generated_token_ids: item.generated_token_ids,
                 cached_len_delta: item.cached_len_delta,
@@ -445,6 +562,11 @@ impl<P: SchedulingPolicy> Scheduler<P> {
             }) {
                 return self.reject_result(&plan, error);
             }
+
+            if let Err(error) = Self::seal_blocks(&mut staged_cache, request, old_cached_len) {
+                return self.reject_result(&plan, error);
+            }
+
             if request.state().is_terminal() {
                 staged_running.retain(|candidate| candidate != &item.request_id);
                 if let Err(error) = staged_cache.release(item.request_id.clone()) {
@@ -452,6 +574,7 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 }
             }
         }
+
         self.requests = staged_requests;
         self.cache = staged_cache;
         self.running = staged_running;

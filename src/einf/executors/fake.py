@@ -1,13 +1,9 @@
-from typing import TYPE_CHECKING
-
 from einf.execution import ExecutionResult, Executor, RequestExecutionResult
-
-if TYPE_CHECKING:
-    from einf.execution_plan import BatchPlan
+from einf.execution_plan import BatchPlan
 
 
 class FakeExecutor(Executor):
-    def execute(self, batch: "BatchPlan") -> ExecutionResult:
+    def execute(self, batch: BatchPlan) -> ExecutionResult:
         results = tuple(
             RequestExecutionResult(
                 request_id=request.request_id,

@@ -1,0 +1,14 @@
+[package]
+name = "einf"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 bindings for the einf Rust control plane"
+license = "MIT"
+
+[lib]
+name = "_control"
+crate-type = ["cdylib"]
+
+[dependencies]
+einf-control = { path = "../einf-control" }
+pyo3 = { version = "0.29", features = ["extension-module"] }

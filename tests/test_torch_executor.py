@@ -1,5 +1,6 @@
 import torch
 
+from einf import SamplingParams, SamplingPlan
 from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
 from einf.config import ModelConfig
 from einf.executors.torch import (
@@ -18,6 +19,11 @@ def make_request(
     need_sample: bool,
     work_type: WorkType,
 ) -> ScheduledRequest:
+    sampling_plan = (
+        SamplingPlan(SamplingParams(), 0)
+        if need_sample
+        else None
+    )
     return ScheduledRequest(
         request_id=request_id,
         input_token_ids=input_token_ids,
@@ -25,6 +31,7 @@ def make_request(
         block_table=block_table,
         work_type=work_type,
         need_sample=need_sample,
+        sampling_plan=sampling_plan,
     )
 
 
@@ -66,17 +73,17 @@ def test_torch_executor_handles_mixed_sampling_and_eos() -> None:
 
     assert result.step_id == 12
     assert result.request_results[0].request_id == "intermediate-prefill"
-    assert result.request_results[0].generated_token_ids == ()
+    assert result.request_results[0].generated_token_ids == []
     assert result.request_results[0].cached_len_delta == 2
     assert result.request_results[0].is_eos is False
 
     assert result.request_results[1].request_id == "final-prefill"
-    assert result.request_results[1].generated_token_ids == (10,)
+    assert result.request_results[1].generated_token_ids == [10]
     assert result.request_results[1].cached_len_delta == 2
     assert result.request_results[1].is_eos is True
 
     assert result.request_results[2].request_id == "decode"
-    assert result.request_results[2].generated_token_ids == (6,)
+    assert result.request_results[2].generated_token_ids == [6]
     assert result.request_results[2].cached_len_delta == 1
     assert result.request_results[2].is_eos is False
 

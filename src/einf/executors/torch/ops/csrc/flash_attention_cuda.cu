@@ -8,8 +8,8 @@
 
 namespace einf::ops {
 
-template <typename scalar_t, int BLOCK_M, int BLOCK_N>
-__global__ void flash_attention_forward_kernel(
+template <typename scalar_t, int BLOCK_M, int BLOCK_N, int HEAD_DIM, int NUM_WARPS>
+__global__ __launch_bounds__(256, 2) void flash_attention_forward_kernel(
     const scalar_t* Q,
     const scalar_t* K,
     const scalar_t* V,
@@ -27,52 +27,73 @@ __global__ void flash_attention_forward_kernel(
       // total slots -> q (BLOCK_M * head_dim) + k (BLOCK_N * head_dim) + v (BLOCK_N * head_dim)
       // each block -> layout: (?, 32) [q_len, head_dim] * [kv_len, head_dim]^T
 
-      extern __shared__ float shared[];
-
       int q_tile_idx = blockIdx.x;
       int q_head_idx = blockIdx.y;
+      int warp_id = threadIdx.x / 32;
+      int lane = threadIdx.x % 32;
 
-      const int kv_tile_size = BLOCK_N * head_dim;
+      constexpr int Q_ROWS_PER_WARP = BLOCK_M / NUM_WARPS;
+      constexpr int kv_tile_size = BLOCK_N * HEAD_DIM;
 
       if (q_head_idx >= num_attention_heads || q_tile_idx >= (q_len + BLOCK_M - 1) / BLOCK_M) {
         return;
       }
 
-      float* q_shared = shared;
-      float* k_shared = shared + BLOCK_M * head_dim;
-      float* v_shared = shared + BLOCK_M * head_dim + BLOCK_N * head_dim;
+      __shared__ scalar_t q_shared[BLOCK_M * HEAD_DIM];
+      __shared__ scalar_t k_shared[BLOCK_N * HEAD_DIM];
+      __shared__ scalar_t v_shared[BLOCK_N * HEAD_DIM];
 
-      int64_t q_global_row = q_tile_idx * BLOCK_M + threadIdx.y;
-      int q_shared_base = threadIdx.y * head_dim;
+      static_assert(BLOCK_M % NUM_WARPS == 0);
+      constexpr int ELEMENTS_PER_LANE = (HEAD_DIM + 31) / 32;
 
-      // Step 1: load Q to shared memory
-      if (q_global_row < q_len) {
-        int64_t q_row_base = q_global_row * num_attention_heads * head_dim + q_head_idx * head_dim;
-        for (int i = threadIdx.x; i < head_dim; i += 32) {
-          q_shared[q_shared_base + i] = Q[q_row_base + i];
-        }
-      } else {
-        for (int i = threadIdx.x; i < head_dim; i += 32) {
-          q_shared[q_shared_base + i] = 0.0f;
+      float m_g[Q_ROWS_PER_WARP];
+      float l_g[Q_ROWS_PER_WARP] = {0.0f};
+      float acc[Q_ROWS_PER_WARP][ELEMENTS_PER_LANE] = {0.0f};
+
+      #pragma unroll
+      for (int i = 0; i < Q_ROWS_PER_WARP; i++) {
+        m_g[i] = -INFINITY;
+      }
+
+      #pragma unroll
+      for (int i = 0; i < Q_ROWS_PER_WARP; i++) {
+        int q_local_row = warp_id * Q_ROWS_PER_WARP + i;
+        int64_t q_global_row = q_tile_idx * BLOCK_M + i + warp_id * Q_ROWS_PER_WARP;
+        int q_shared_base = q_local_row * HEAD_DIM;
+
+        // Step 1: load Q to shared memory
+        if (q_global_row < q_len) {
+          int64_t q_row_base = q_global_row * num_attention_heads * head_dim + q_head_idx * head_dim;
+          for (int i = lane; i < HEAD_DIM; i += 32) {
+            q_shared[q_shared_base + i] = Q[q_row_base + i];
+          }
+        } else {
+          for (int i = lane; i < HEAD_DIM; i += 32) {
+            q_shared[q_shared_base + i] = 0.0f;
+          }
         }
       }
 
       __syncthreads();
 
       int head_kv = q_head_idx / (num_attention_heads / num_kv_heads);
-      int num_threads = blockDim.x * blockDim.y;
+      int num_threads = blockDim.x;
 
-      float m_i = -1e20f;
-      float l_i = 0.0f;
-
-      // max head_dim = 256
-      float accum[8] = {0.0f};
-      float S[BLOCK_N];
-      int element_per_thread = (head_dim + 31) / 32;
-
-      for (int i = 0; i < kv_len; i += BLOCK_N) {
+      const int64_t q_tile_start =
+          static_cast<int64_t>(q_tile_idx) * BLOCK_M;
+      const int64_t q_tile_end =
+          q_tile_start + BLOCK_M < q_len
+          ? q_tile_start + BLOCK_M
+          : q_len;
+      const int64_t last_absolute_q_idx =
+          start_pos + q_tile_end - 1;
+      const int64_t kv_end =
+          last_absolute_q_idx + 1 < kv_len
+          ? last_absolute_q_idx + 1
+          : kv_len;
+      for (int i = 0; i < kv_end; i += BLOCK_N) {
         // Step 2: load KV to shared memory
-        int tid = threadIdx.y * blockDim.x + threadIdx.x;
+        int tid = threadIdx.x;
 
         for (int j = tid; j < kv_tile_size; j += num_threads) {
           int row = j / head_dim;
@@ -92,76 +113,106 @@ __global__ void flash_attention_forward_kernel(
 
         __syncthreads();
 
-        for (int j = 0; j < BLOCK_N; j++) {
-          float sum = 0.0f;
-
-          for (int k = threadIdx.x; k < head_dim; k += 32) {
-            sum += q_shared[threadIdx.y * head_dim + k] * k_shared[j * head_dim + k];
-          }
-
-          for (int offset = 16; offset >= 1; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
-          }
+        #pragma unroll
+        for (int row = 0; row < Q_ROWS_PER_WARP; row++) {
+          int q_local_row = warp_id * Q_ROWS_PER_WARP + row;
+          int64_t q_global_row = q_tile_idx * BLOCK_M + q_local_row;
 
           const int64_t absolute_query_pos = start_pos + q_global_row;
-          const int64_t global_key_idx = i + j;
-
-          if (global_key_idx <= absolute_query_pos && global_key_idx < kv_len) {
-            S[j] = sum * scale;
-          } else {
-            S[j] = -1e20f;
+          if (i > absolute_query_pos) {
+            continue;
           }
-        }
 
-        float m_j = -1e20f;
-        for (int j = 0; j < BLOCK_N; j++) {
-          if (S[j] > m_j) {
-            m_j = S[j];
-          }
-        }
+          float S[BLOCK_N] = {0.0f};
 
-        float m_new = fmaxf(m_j, m_i);
-        float sum_j = 0.0f;
-        for (int j = 0; j < BLOCK_N; j++) {
-          sum_j += expf(S[j] - m_new);
-          S[j] = expf(S[j] - m_new);
-        }
+          for (int j = 0; j < BLOCK_N; j++) {
+            float sum = 0.0f;
 
-        float alpha = expf(m_i - m_new);
-        float l_new = l_i * alpha + sum_j;
-
-        for (int step = 0; step < element_per_thread; step++) {
-          int d = threadIdx.x + step * 32;
-
-          if (d < head_dim) {
-            accum[step] *= alpha;
-
-            float pv_sum = 0.0f;
-
-            for (int k = 0; k < BLOCK_N; k++) {
-              pv_sum += S[k] * v_shared[k * head_dim + d];
+            for (int k = lane; k < HEAD_DIM; k += 32) {
+              sum = fmaf(
+                  static_cast<float>(q_shared[q_local_row * HEAD_DIM + k]),
+                  static_cast<float>(k_shared[j * HEAD_DIM + k]),
+                  sum);
             }
 
-            accum[step] += pv_sum;
-          }
-        }
+            for (int offset = 16; offset >= 1; offset >>= 1) {
+              sum += __shfl_xor_sync(0xffffffff, sum, offset);
+            }
 
-        m_i = m_new;
-        l_i = l_new;
+            const int64_t absolute_query_pos = start_pos + q_global_row;
+            const int64_t global_key_idx = i + j;
+
+            if (global_key_idx <= absolute_query_pos && global_key_idx < kv_len) {
+              S[j] = sum * scale;
+            } else {
+              S[j] = -1e20f;
+            }
+          }
+
+          float m_j = -1e20f;
+
+          #pragma unroll
+          for (int j = 0; j < BLOCK_N; j++) {
+            if (S[j] > m_j) {
+              m_j = S[j];
+            }
+          }
+
+          float m_new = fmaxf(m_j, m_g[row]);
+          float sum_j = 0.0f;
+
+          #pragma unroll
+          for (int j = 0; j < BLOCK_N; j++) {
+            const float prob = expf(S[j] - m_new);
+            sum_j += prob;
+            S[j] = prob;
+          }
+
+          float alpha = expf(m_g[row] - m_new);
+          float l_new = l_g[row] * alpha + sum_j;
+
+          #pragma unroll
+          for (int step = 0; step < ELEMENTS_PER_LANE; step++) {
+            int d = lane + step * 32;
+
+            if (d < head_dim) {
+              acc[row][step] *= alpha;
+
+              float pv_sum = 0.0f;
+
+              for (int k = 0; k < BLOCK_N; k++) {
+                pv_sum = fmaf(
+                    S[k],
+                    static_cast<float>(v_shared[k * HEAD_DIM + d]),
+                    pv_sum);
+              }
+
+              acc[row][step] += pv_sum;
+            }
+          }
+
+          m_g[row] = m_new;
+          l_g[row] = l_new;
+        }
 
         __syncthreads();
       }
 
-      int64_t out_global_row = q_tile_idx * BLOCK_M + threadIdx.y;
+      #pragma unroll
+      for (int row = 0; row < Q_ROWS_PER_WARP; row++) {
+        int q_local_row = warp_id * Q_ROWS_PER_WARP + row;
+        int64_t out_global_row = q_tile_idx * BLOCK_M + q_local_row;
 
-      if (out_global_row < q_len) {
-        int64_t out_row_base = out_global_row * num_attention_heads * head_dim + q_head_idx * head_dim;
+        if (out_global_row < q_len) {
+          int64_t out_row_base = out_global_row * num_attention_heads * head_dim + q_head_idx * HEAD_DIM;
 
-        for (int step = 0; step < element_per_thread; step++) {
-          int d = threadIdx.x + step * 32;
+          #pragma unroll
+          for (int step = 0; step < ELEMENTS_PER_LANE; step++) {
+            int d = lane + step * 32;
 
-          if (d < head_dim) {
-            output[out_row_base + d] = static_cast<scalar_t>(accum[step] / l_i);
+            if (d < HEAD_DIM) {
+              output[out_row_base + d] = static_cast<scalar_t>(acc[row][step] / l_g[row]);
+            }
           }
         }
       }
@@ -186,8 +237,10 @@ at::Tensor flash_attention_cuda(
   const int64_t num_kv_heads = K.size(1);
   auto output = at::empty_like(Q);
 
-  constexpr int block_m = 4;
+  constexpr int block_m = 16;
   constexpr int block_n = 16;
+  constexpr int compile_head_dim = 64;
+  constexpr int num_warps = 8;
   constexpr int warp_size = 32;
 
   TORCH_CHECK(
@@ -195,13 +248,10 @@ at::Tensor flash_attention_cuda(
       "einf::flash_attention v0 requires head_dim == 64, got ",
       head_dim);
 
-  const dim3 threads(warp_size, block_m);
+  const dim3 threads(warp_size * num_warps);
   const dim3 blocks(
       static_cast<unsigned int>((q_len + block_m - 1) / block_m),
       static_cast<unsigned int>(num_attention_heads));
-  const size_t shared_memory_bytes =
-      static_cast<size_t>(block_m + 2 * block_n) *
-      static_cast<size_t>(head_dim) * sizeof(float);
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -210,8 +260,13 @@ at::Tensor flash_attention_cuda(
       Q.scalar_type(),
       "flash_attention_cuda",
       [&] {
-        flash_attention_forward_kernel<scalar_t, block_m, block_n>
-            <<<blocks, threads, shared_memory_bytes, stream>>>(
+        flash_attention_forward_kernel<
+            scalar_t,
+            block_m,
+            block_n,
+            compile_head_dim,
+            num_warps>
+            <<<blocks, threads, 0, stream>>>(
                 Q.data_ptr<scalar_t>(),
                 K.data_ptr<scalar_t>(),
                 V.data_ptr<scalar_t>(),

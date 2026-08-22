@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from einf.scheduler import ScheduledBatch
+    from einf.execution_plan import BatchPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,5 +22,5 @@ class ExecutionResult:
 
 class Executor(ABC):
     @abstractmethod
-    def execute(self, batch: "ScheduledBatch") -> ExecutionResult:
+    def execute(self, batch: "BatchPlan") -> ExecutionResult:
         pass

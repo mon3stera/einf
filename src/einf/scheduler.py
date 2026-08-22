@@ -11,31 +11,20 @@ from typing import Iterator
 
 from einf.cache.manager import KVCacheManager
 from einf.execution import ExecutionResult
+from einf.execution_plan import (
+    BatchPlan,
+    ScheduledBatch,
+    ScheduledRequest,
+    WorkType,
+)
 from einf.request import AdvanceResult, CompletionReason, Request, RequestSpec, RequestState
 
 
 @dataclass
 class RequestBundle:
     request_id: str
-    work_type: "WorkType"
-
-class WorkType(Enum):
-    PREFILL = auto()
-    DECODE = auto()
-
-@dataclass(frozen=True, slots=True)
-class ScheduledRequest:
-    request_id: str
-    input_token_ids: tuple[int, ...]
     work_type: WorkType
-    start_position: int
-    block_table: tuple[int, ...]
-    need_sample: bool
 
-@dataclass(frozen=True, slots=True)
-class ScheduledBatch:
-    step_id: int
-    requests: tuple[ScheduledRequest, ...]
 
 class Policy(ABC):
     @abstractmethod
@@ -251,7 +240,7 @@ class Scheduler:
             scheduled_len,
         )
 
-    def schedule(self) -> ScheduledBatch | None:
+    def schedule(self) -> BatchPlan | None:
         remaining_len = self._max_batch_len
         scheduled_requests: list[ScheduledRequest] = []
 
@@ -299,7 +288,7 @@ class Scheduler:
         if not scheduled_requests:
             return None
 
-        batch = ScheduledBatch(
+        batch = BatchPlan(
             step_id=self._next_step_id,
             requests=tuple(scheduled_requests),
         )

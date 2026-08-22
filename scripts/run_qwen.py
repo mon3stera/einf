@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batch-len", type=int, default=128)
     parser.add_argument("--max-prefill-chunk-len", type=int, default=128)
     parser.add_argument("--flash-attention", action="store_true")
+    parser.add_argument("--paged-decode-attention", action="store_true")
+    parser.add_argument("--paged-decode-max-splits", type=int, default=64)
     parser.add_argument("--compare-hf", action="store_true")
     return parser.parse_args()
 
@@ -67,6 +69,8 @@ def main() -> None:
         config,
         cache=cache,
         use_flash_attention=args.flash_attention,
+        use_paged_decode_attention=args.paged_decode_attention,
+        paged_decode_max_splits=args.paged_decode_max_splits,
     ).to(
         device=device,
         dtype=dtype,

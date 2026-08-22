@@ -6,6 +6,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 
 from einf.executors.torch.model_runner import build_causal_mask, repeat_kv
 from einf.executors.torch.ops import (
@@ -16,7 +19,6 @@ from einf.executors.torch.ops import (
 
 
 DTYPES = {
-    "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
@@ -30,13 +32,22 @@ class AttentionCase:
 
 
 CASES = (
-    AttentionCase("decode-128", 1, 128),
-    AttentionCase("decode-512", 1, 512),
-    AttentionCase("chunk-16/128", 16, 128),
-    AttentionCase("chunk-64/512", 64, 512),
     AttentionCase("prefill-128", 128, 128),
     AttentionCase("prefill-512", 512, 512),
+    AttentionCase("prefill-2048", 2048, 2048),
+    AttentionCase("prefill-4096", 4096, 4096),
+    AttentionCase("chunk-128/512", 128, 512),
+    AttentionCase("chunk-128/2048", 128, 2048),
+    AttentionCase("chunk-128/8192", 128, 8192),
+    AttentionCase("chunk-128/32768", 128, 32768),
 )
+
+QUICK_CASE_NAMES = {
+    "prefill-128",
+    "prefill-512",
+    "chunk-128/512",
+    "chunk-128/2048",
+}
 
 
 def benchmark_us(
@@ -85,9 +96,33 @@ def qwen_eager_attention(
     return (probabilities @ context_V).transpose(0, 1)
 
 
+def pytorch_flash_sdpa(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    *,
+    scale: float,
+    causal_bias: object,
+) -> torch.Tensor:
+    output = F.scaled_dot_product_attention(
+        Q.transpose(0, 1).unsqueeze(0),
+        K.transpose(0, 1).unsqueeze(0),
+        V.transpose(0, 1).unsqueeze(0),
+        attn_mask=causal_bias,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+        enable_gqa=True,
+    )
+    return output.squeeze(0).transpose(0, 1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark Qwen eager, naive native, and FlashAttention paths"
+        description=(
+            "Benchmark Qwen eager, PyTorch forced Flash SDPA, and einf's "
+            "correctness-first native FlashAttention"
+        )
     )
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument("--num-attention-heads", type=int, default=14)
@@ -98,7 +133,12 @@ def main() -> None:
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="skip the two largest Prefill cases",
+        help="run two small full-Prefill and two small chunked-Prefill cases",
+    )
+    parser.add_argument(
+        "--include-naive",
+        action="store_true",
+        help="also time the three-kernel native oracle (expensive on large cases)",
     )
     args = parser.parse_args()
 
@@ -113,7 +153,9 @@ def main() -> None:
     load_custom_ops()
     dtype = DTYPES[args.dtype]
     scale = 1.0 / math.sqrt(args.head_dim)
-    cases = CASES[:4] if args.quick else CASES
+    cases = tuple(
+        case for case in CASES if not args.quick or case.name in QUICK_CASE_NAMES
+    )
 
     print(f"device: {torch.cuda.get_device_name()}")
     print(f"torch: {torch.__version__}, cuda: {torch.version.cuda}, dtype: {dtype}")
@@ -122,9 +164,10 @@ def main() -> None:
         f"D={args.head_dim}, warmup={args.warmup}, iterations={args.iterations}"
     )
     print("Qwen eager includes repeat_kv and causal-mask construction.")
+    print("PyTorch SDPA is forced to SDPBackend.FLASH_ATTENTION.")
     print(
-        f"{'case':>16} {'qwen_us':>11} {'naive_us':>11} {'flash_us':>11} "
-        f"{'qwen/flash':>11} {'naive/flash':>12}"
+        f"{'case':>18} {'eager_us':>11} {'sdpa_us':>11} {'native_us':>11} "
+        f"{'native_%':>10} {'eager/native':>13}"
     )
 
     with torch.inference_mode():
@@ -141,8 +184,9 @@ def main() -> None:
             )
             V = torch.randn_like(K)
             start_pos = case.kv_len - case.q_len
+            causal_bias = causal_lower_right(case.q_len, case.kv_len)
 
-            def run_qwen() -> torch.Tensor:
+            def run_eager() -> torch.Tensor:
                 return qwen_eager_attention(
                     Q,
                     K,
@@ -151,42 +195,74 @@ def main() -> None:
                     scale=scale,
                 )
 
-            def run_naive() -> torch.Tensor:
-                return contiguous_attention(Q, K, V, start_pos, scale)
+            def run_sdpa() -> torch.Tensor:
+                return pytorch_flash_sdpa(
+                    Q,
+                    K,
+                    V,
+                    scale=scale,
+                    causal_bias=causal_bias,
+                )
 
-            def run_flash() -> torch.Tensor:
+            def run_native() -> torch.Tensor:
                 return flash_attention(Q, K, V, start_pos, scale)
 
-            expected = run_qwen()
-            naive_output = run_naive()
-            flash_output = run_flash()
-            if dtype == torch.float32:
-                rtol = atol = 1e-4
-            else:
-                rtol = atol = 3e-2
-            torch.testing.assert_close(naive_output, expected, rtol=rtol, atol=atol)
-            torch.testing.assert_close(flash_output, expected, rtol=rtol, atol=atol)
+            expected = run_eager()
+            native_output = run_native()
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                sdpa_output = run_sdpa()
 
-            qwen_us = benchmark_us(
-                run_qwen,
+            rtol = atol = 3e-2
+            torch.testing.assert_close(
+                native_output,
+                expected,
+                rtol=rtol,
+                atol=atol,
+            )
+            torch.testing.assert_close(
+                sdpa_output,
+                expected,
+                rtol=rtol,
+                atol=atol,
+            )
+
+            eager_us = benchmark_us(
+                run_eager,
                 warmup=args.warmup,
                 iterations=args.iterations,
             )
-            naive_us = benchmark_us(
-                run_naive,
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                sdpa_us = benchmark_us(
+                    run_sdpa,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                )
+            native_us = benchmark_us(
+                run_native,
                 warmup=args.warmup,
                 iterations=args.iterations,
             )
-            flash_us = benchmark_us(
-                run_flash,
-                warmup=args.warmup,
-                iterations=args.iterations,
-            )
+
             print(
-                f"{case.name:>16} {qwen_us:11.3f} {naive_us:11.3f} "
-                f"{flash_us:11.3f} {qwen_us / flash_us:11.2f} "
-                f"{naive_us / flash_us:12.2f}"
+                f"{case.name:>18} {eager_us:11.3f} {sdpa_us:11.3f} "
+                f"{native_us:11.3f} {100 * sdpa_us / native_us:9.1f}% "
+                f"{eager_us / native_us:13.2f}"
             )
+
+            if args.include_naive:
+                naive_output = contiguous_attention(Q, K, V, start_pos, scale)
+                torch.testing.assert_close(
+                    naive_output,
+                    expected,
+                    rtol=rtol,
+                    atol=atol,
+                )
+                naive_us = benchmark_us(
+                    lambda: contiguous_attention(Q, K, V, start_pos, scale),
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                )
+                print(f"{'three-kernel oracle':>18} {naive_us:11.3f} us")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ def make_input(
     *,
     start_position: int,
     block_table: tuple[int, ...],
+    block_len: int = 2,
+    device: torch.device = torch.device("cpu"),
 ) -> ModelInput:
     batch = ScheduledBatch(
         step_id=0,
@@ -63,7 +65,7 @@ def make_input(
             ),
         ),
     )
-    return ModelInput.from_batch(batch, block_len=2, device=torch.device("cpu"))
+    return ModelInput.from_batch(batch, block_len=block_len, device=device)
 
 
 def test_qwen_cached_decode_matches_full_recompute() -> None:
@@ -206,3 +208,86 @@ def test_qwen_flash_attention_matches_eager_attention() -> None:
         flash_logits = flash_runner(model_input).logits
 
     torch.testing.assert_close(flash_logits, eager_logits, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    (
+        (torch.float32, 1e-4, 1e-4),
+        (torch.bfloat16, 2e-2, 3e-1),
+    ),
+)
+def test_qwen_split_kv_decode_matches_eager_attention(
+    dtype: torch.dtype,
+    rtol: float,
+    atol: float,
+) -> None:
+    torch.manual_seed(3)
+    config = QwenConfig(
+        vocab_size=32,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_theta=10000.0,
+        max_position_embeddings=128,
+        tie_word_embeddings=True,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    geometry = KVCacheGeometry(
+        num_layers=config.num_hidden_layers,
+        num_blocks=8,
+        block_len=4,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+    )
+    eager_runner = QwenModelRunner(
+        config,
+        cache=TorchKVCacheStorage(
+            geometry,
+            dtype=dtype,
+            device="cuda",
+            use_custom_ops=True,
+        ),
+    ).to(device="cuda", dtype=dtype).eval()
+    paged_runner = QwenModelRunner(
+        config,
+        cache=TorchKVCacheStorage(
+            geometry,
+            dtype=dtype,
+            device="cuda",
+            use_custom_ops=True,
+        ),
+        use_paged_decode_attention=True,
+    ).to(device="cuda", dtype=dtype).eval()
+    paged_runner.load_state_dict(eager_runner.state_dict())
+
+    block_table = tuple(range(8))
+    prefill_ids = tuple((index % 29) + 3 for index in range(31))
+    prefill_input = make_input(
+        prefill_ids,
+        start_position=0,
+        block_table=block_table,
+        block_len=4,
+        device=torch.device("cuda"),
+    )
+    decode_input = make_input(
+        (7,),
+        start_position=31,
+        block_table=block_table,
+        block_len=4,
+        device=torch.device("cuda"),
+    )
+
+    with torch.inference_mode():
+        eager_runner(prefill_input)
+        paged_runner(prefill_input)
+        eager_logits = eager_runner(decode_input).logits
+        paged_logits = paged_runner(decode_input).logits
+
+    torch.testing.assert_close(paged_logits, eager_logits, rtol=rtol, atol=atol)

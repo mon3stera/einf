@@ -1,7 +1,7 @@
 
 from dataclasses import dataclass
 
-from einf.scheduler import ScheduledBatch
+from einf.execution_plan import BatchPlan
 import torch
 from torch import Tensor
 
@@ -16,7 +16,7 @@ class ModelInput:
     context_lens: Tensor
 
     @classmethod
-    def from_batch(cls, batch: ScheduledBatch, *, block_len: int, device: torch.device) -> "ModelInput":
+    def from_plan(cls, plan: BatchPlan, *, block_len: int, device: torch.device) -> "ModelInput":
         input_token_ids = []
         position = []
         slot_mapping = []
@@ -24,7 +24,7 @@ class ModelInput:
         context_lens = []
         block_tables = []
 
-        for request in batch.requests:
+        for request in plan.requests:
             input_token_ids.extend(request.input_token_ids)
 
             position.extend([request.start_position + i for i in range(len(request.input_token_ids))])
@@ -57,3 +57,8 @@ class ModelInput:
             block_tables=torch.nn.utils.rnn.pad_sequence(block_tables, batch_first=True, padding_value=-1),
             context_lens=torch.tensor(context_lens, device=device, dtype=torch.long),
         )
+
+    @classmethod
+    def from_batch(cls, batch: BatchPlan, *, block_len: int, device: torch.device) -> "ModelInput":
+        """Backward-compatible alias for the cross-language plan boundary."""
+        return cls.from_plan(batch, block_len=block_len, device=device)

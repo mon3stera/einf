@@ -16,10 +16,80 @@ The gather benchmark reports both the complete PyTorch block-table mapping path
 and a precomputed-slot `index_select` path. Their difference estimates mapping
 overhead separately from KV data movement.
 
+## CuTe GEMM
+
+Build the pinned CUTLASS profiler with only the FP32 SIMT and TF32 Tensor Core
+kernel families needed by the GEMM benchmark:
+
+```bash
+scripts/build_cutlass_profiler.sh
+```
+
+Then compare the current FP32 `einf::cute_gemm` kernel with CUTLASS:
+
+```bash
+python benchmarks/benchmark_cute_gemm.py
+```
+
+`cute_gemm` consumes row-major `A[M,K]` and `B[K,N]`, requires `M`, `N`, and
+`K` to be divisible by four, and produces row-major `C[M,N]`. CUTLASS
+Profiler's generated kernels use column-major C, so the
+benchmark runs the memory-equivalent transposed problem
+`C^T[N,M] = B^T[N,K] @ A^T[K,M]` through CUTLASS NN column-major kernels. Both
+paths reuse one input workspace so CUDA-event timings represent warm-cache
+kernel execution rather than allocation or process startup.
+
+CUTLASS FP32 SIMT is the arithmetic-matched golden: both paths use IEEE FP32
+multiplication and accumulation. CUTLASS TF32 Tensor Core is reported separately
+as an aspirational performance ceiling because its FP32 inputs are rounded to
+TF32 before multiplication and are therefore not numerically equivalent to the
+current kernel. The script profiles every compiled candidate in each family and
+reports the fastest kernel per shape. It reads the selected CSV row's explicit
+`cta_m/n/k`, `stages`, Warp shape, instruction shape, raster order, and swizzle
+metadata instead of inferring the configuration only from the procedural kernel
+name. It also reads the current `cute_gemm_cuda.cu` constants and groups shapes
+by CUTLASS's selected FP32 SIMT configuration. This makes the output directly
+usable when choosing new custom tile variants; matching the CTA tile alone does
+not match CUTLASS's Warp decomposition, copy schedule, epilogue, or raster order.
+Use `--quick` while iterating or `--shapes
+128x512x512,512x2048x512` for a targeted MxNxK sweep.
+
+### RTX 4090 FP32 two-stage `cp.async` baseline
+
+Environment: PyTorch 2.10.0+cu128, CUDA 12.8, pinned CUTLASS
+`c506e16788cb08416a4a57e11a9067beeee29420`, 20 warmup iterations, 100 measured
+iterations, and one reused workspace:
+
+```text
+          MxNxK   cute_us  cute_TF  simt_us  simt_TF  simt_%  tf32_us  tf32_TF  tf32_%
+    128x128x128     7.065     0.59    7.752     0.54   109.7%    3.779      1.11    53.5%
+    256x256x256    12.268     2.74   13.179     2.55   107.4%    5.458      6.15    44.5%
+    512x512x512    22.695    11.83   24.095    11.14   106.2%    9.124     29.42    40.2%
+ 1024x1024x1024    80.919    26.54   50.678    42.38    62.6%   29.737     72.22    36.7%
+ 2048x2048x2048   604.627    28.41  273.203    62.88    45.2%  193.679     88.70    32.0%
+    128x512x512    21.179     3.17   24.013     2.79   113.4%    9.083      7.39    42.9%
+   512x2048x512    41.842    25.66   27.075    39.66    64.7%   16.722     64.21    40.0%
+   512x512x2048    84.353    12.73   80.108    13.40    95.0%   30.341     35.39    36.0%
+    508x508x516    25.324    10.52   25.498    10.44   100.7%    9.779     27.23    38.6%
+```
+
+`simt_%` and `tf32_%` are current-kernel throughput as a percentage of the
+corresponding CUTLASS result: `100 * cutlass_latency / cute_latency`. The
+64x64x32 two-stage kernel matches or slightly exceeds the selected CUTLASS FP32
+SIMT family through square 512 and on the partial-CTA 508x508x516 case. It reaches
+62.6% and 45.2% of CUTLASS SIMT at square 1024 and 2048, substantially improving
+the prior 15.2% and 11.4%. The larger CTA regresses the old 128/256 results by
+1.69x/1.41x because those grids expose launch and occupancy costs, while square
+512/1024/2048 improve by 2.02x/4.11x/4.01x. These gains combine the larger CTA,
+per-thread register micro-tiles, vectorized movement, and asynchronous pipeline;
+they should not be attributed to `cp.async` alone. The TF32 ceiling remains a
+different numerical contract and reaches 88.70 TFLOP/s at square 2048 versus
+28.41 TFLOP/s for the current IEEE-FP32 CUDA-Core kernel.
+
 ## Attention kernels
 
-Compare the current Qwen eager Attention body, the three-kernel native oracle,
-and the correctness-first FlashAttention kernel:
+Compare the current Qwen eager Attention body, PyTorch's forced Flash SDPA
+backend, and einf's correctness-first native FlashAttention kernel:
 
 ```bash
 python benchmarks/benchmark_attention.py
@@ -28,7 +98,11 @@ python benchmarks/benchmark_attention.py
 The benchmark defaults to Qwen2.5-0.5B geometry (`Hq=14`, `Hkv=2`, `D=64`)
 and BF16. Its Qwen eager measurement includes `repeat_kv` and causal-mask
 construction because those operations are part of the current
-`QwenAttention` implementation. Use `--quick` while iterating on kernels.
+`QwenAttention` implementation. PyTorch SDPA is forced through
+`SDPBackend.FLASH_ATTENTION` and receives `causal_lower_right(q_len,kv_len)`, so
+chunked Prefill uses the same tail-aligned causality as einf. Use `--quick`
+while iterating on kernels and `--include-naive` only when the expensive
+three-kernel oracle timing is needed.
 
 ### RTX 4090 BF16 baseline
 
@@ -36,20 +110,78 @@ Environment: PyTorch 2.10.0+cu128, CUDA 12.8, `Hq=14`, `Hkv=2`, `D=64`, 20
 warmup iterations, and 100 measured iterations.
 
 ```text
-            case     qwen_us    naive_us    flash_us  qwen/flash  naive/flash
-      decode-128      65.708      23.962      34.634        1.90         0.69
-      decode-512      65.577      80.346     131.584        0.50         0.61
-    chunk-16/128      66.435      58.212      34.550        1.92         1.68
-    chunk-64/512      67.256     299.376     137.267        0.49         2.18
-     prefill-128      66.621      97.407      43.303        1.54         2.25
-     prefill-512      74.967     597.041     369.244        0.20         1.62
+              case    eager_us     sdpa_us   native_us   native_%
+       prefill-128      66.724      12.134      29.225       41.5%
+       prefill-512      75.284      17.713     233.527        7.6%
+      prefill-2048    2052.710     108.788    2248.530        4.8%
+      prefill-4096    8581.143     291.000    8177.222        3.6%
+     chunk-128/512      66.918      19.081      99.604       19.2%
+    chunk-128/2048      79.677      18.780     391.455        4.8%
+    chunk-128/8192     439.478      43.477    1557.593        2.8%
+   chunk-128/32768    2351.306     119.364    6207.220        1.9%
 ```
 
-The fused learner kernel removes the global score Tensor and wins some smaller
-workloads by avoiding eager launch/mask/repeat overhead. It becomes much slower
-as Context and Query lengths grow because each warp serially processes Keys and
-uses ordinary FP32 CUDA cores rather than Tensor Cores. These numbers are not a
-production-performance claim.
+`native_%` is native throughput as a percentage of forced Flash SDPA throughput:
+`100 * sdpa_latency / native_latency`. This version uses `BLOCK_M=16`,
+`BLOCK_N=16`, eight Warps per CTA, two Query rows per Warp, and
+`__launch_bounds__(256, 2)`. The earlier dynamic-FP32-Shared experiment reduced
+registers from 142 to 128 per thread without local-memory spills. Relative to the
+unconstrained Sliced-Q build, full Prefill 512/2048/4096 improved by
+1.30x/1.34x/1.36x, while Prefill 128 and the chunked-Prefill cases regressed by
+roughly 3–5%. The kernel then added CTA-wide causal K/V-tile skipping, improving
+full Prefill 512/2048/4096 by another 1.38x/1.73x/1.88x while fixed-`q_len=128`
+chunked Prefill changed by only about 2%.
+
+Q/K/V Shared storage is now static and dtype-specific: BF16/FP16 instantiate
+6,144 bytes per CTA and FP32 instantiates 12,288 bytes. Arithmetic, Online
+Softmax statistics, and output accumulation remain FP32. `cuobjdump` reports 71
+registers and no local-memory use for the BF16 specialization. A controlled
+static-Shared A/B changed full Prefill 128/512/2048/4096 from
+29.495/232.622/2244.137/8203.738 us with FP32 Shared to
+29.225/233.527/2248.530/8177.222 us with BF16 Shared: effectively neutral. The
+chunked cases improved consistently by about 1.1%, from
+100.680/395.991/1576.100/6280.049 us to
+99.604/391.455/1557.593/6207.220 us. The previous Nsight occupancy report
+predates static Shared storage and should not be treated as the current resource
+profile. Medium/large native Prefill still reaches only 3.6–7.6% of Flash SDPA
+throughput; the next large step requires matrix/Tensor-Core execution rather
+than additional scalar Shared-storage tuning.
+
+### Nsight Compute
+
+`profile_flash_attention.py` isolates one native FlashAttention shape so Nsight
+Compute does not need to filter eager and SDPA kernels from the full benchmark:
+The extension is built with CUDA `-lineinfo` so the Source page can map sampled
+instructions back to the kernel.
+
+```bash
+python benchmarks/profile_flash_attention.py \
+  --q-len 128 \
+  --kv-len 32768 \
+  --warmup 10
+```
+
+Profile the launch after the ten warmups:
+
+```bash
+ncu \
+  --set basic \
+  --kernel-name-base function \
+  --kernel-name 'regex:.*flash_attention_forward_kernel.*' \
+  --launch-skip 10 \
+  --launch-count 1 \
+  --export /tmp/einf-flash-basic \
+  --force-overwrite \
+  python benchmarks/profile_flash_attention.py \
+    --q-len 128 \
+    --kv-len 32768 \
+    --warmup 10
+```
+
+After the basic pass, replace `--set basic` with `--set full` for scheduler,
+memory, occupancy, instruction, and Warp-stall sections. GPU performance
+counters must be enabled by the system administrator; otherwise `ncu` reports
+`ERR_NVGPUCTRPERM`.
 
 ## Paged Decode Attention
 
@@ -131,3 +263,145 @@ earlier cap is not a universal policy. Cache residency, kernel/backend threshold
 workspace reduction, and GQA read reuse need profiler evidence before assigning
 the crossover to one cause. Batch size, head geometry, and GPU architecture must
 also participate in the eventual dispatch rule.
+
+## Qwen2.5 end-to-end latency
+
+Measure one request through `Scheduler -> TorchExecutor -> QwenModelRunner`,
+excluding model loading and one warmup request per prompt shape:
+
+```bash
+python benchmarks/benchmark_qwen_e2e.py \
+  --prompt-lens 16,128,512,2048 \
+  --max-new-len 32 \
+  --max-prefill-chunk-len 2048 \
+  --max-batch-len 2048 \
+  --paged-decode-attention
+```
+
+`TTFT` starts immediately before submit and includes scheduling, Prefill, and
+first-token sampling. `TPOT` and Decode tokens/s cover the remaining generated
+tokens. By default EOS is ignored so every repetition produces the requested
+number of tokens. This is a single-request latency benchmark, not a concurrent
+serving-throughput benchmark.
+
+RTX 4090 BF16, Qwen2.5-0.5B, 32 output tokens, one warmup and three measured
+requests per shape:
+
+```text
+backend         prompt   TTFT ms   TPOT ms   Decode tok/s   E2E tok/s
+gather+eager        16     10.309      9.398         106.40      106.05
+gather+eager       128     11.060      9.571         104.49      103.90
+gather+eager       512     11.715      9.484         105.44      104.67
+gather+eager      2048     70.552      9.601         104.15       86.90
+split-kv             16     10.578      6.291         158.95      155.63
+split-kv            128     11.257      6.371         156.97      153.29
+split-kv            512     11.855      6.393         156.41      152.40
+split-kv           2048     70.519      6.360         157.23      119.54
+gather+native       16      6.832      6.529         153.17      152.95
+gather+native      128      7.298      6.502         153.79      153.20
+gather+native      512     16.304      7.278         137.40      132.26
+gather+native     2048    151.909     15.683          63.76       50.11
+```
+
+The learning Flash kernel wins on short Contexts through lower launch and score
+materialization overhead, then loses as its serial Key traversal dominates.
+With eager Attention and a 128-token Prefill chunk, TTFT rises from 11.715 to
+44.205 ms at prompt 512 and from 70.552 to 176.317 ms at prompt 2048. That is the
+expected latency cost of preserving chunked-Prefill admission opportunities.
+
+With `--paged-decode-attention`, `q_len == 1` reads physical cache blocks
+directly. Short Contexts use the single-CTA Paged kernel; longer Contexts use the
+adaptive Split-KV path with a maximum of 64 Splits. Prefill continues to use the
+selected gathered eager/native backend.
+
+With 128-token Prefill chunks and eight output tokens, the long-Context Decode
+comparison is:
+
+```text
+prompt   eager TPOT   split TPOT   eager tok/s   split tok/s   speedup
+4096         10.169        6.423         98.34        155.70      1.58x
+8192         10.122        6.484         98.80        154.23      1.56x
+16384        10.192        6.573         98.12        152.14      1.55x
+32768        14.089        6.561         70.98        152.41      2.15x
+```
+
+TTFT is nearly unchanged because Prefill is intentionally still gathered eager
+Attention. The model configuration declares a 32768-token maximum context;
+synthetic 128K Prompt tests are therefore not representative model inference.
+Very long cache-read behavior remains covered by the standalone Paged Decode
+benchmarks. A serving benchmark should instead model repeated request arrivals,
+chunked Prefill, and Decode-to-completion interleaving.
+
+FP32 and BF16 logits pass backend-parity tolerances. Exact greedy token sequences
+can still diverge when two BF16 logits are effectively tied; one real-model
+smoke test differed at a step where the Paged path gave both candidate logits
+16.75. This is a numerical backend difference rather than a cache/addressing
+failure.
+
+## Qwen2.5 steady-state serving
+
+`benchmark_qwen_serving.py` maintains a closed-loop target concurrency. Requests
+use deterministic random token IDs and sampled Prompt/output lengths; completed
+requests are immediately replaced. This naturally creates mixed chunked-Prefill
+and Decode batches without requiring meaningful model output:
+
+```bash
+python benchmarks/benchmark_qwen_serving.py \
+  --decode-backend paged \
+  --concurrency 8 \
+  --prompt-lens 128,512,2048 \
+  --output-lens 32,64,128 \
+  --max-prefill-chunk-len 128 \
+  --max-batch-len 512
+```
+
+The default benchmark warms eight completions and then collects latency samples
+from 32 newly submitted requests. Aggregate throughput includes every token and
+completion during the steady-state measurement window. EOS is disabled so eager
+and Paged runs execute exactly the same seeded workload.
+
+RTX 4090 BF16, concurrency 8:
+
+```text
+metric                         gathered eager     Paged/Split-KV
+output tokens/s                        252.46             425.99
+requests/s                               3.343              5.640
+TTFT p50 / p95 ms               119.683 / 498.620   78.197 / 373.467
+inter-token p50 / p95 ms         29.448 / 31.124    15.466 / 22.969
+request latency p50 / p95 ms   1987.140 / 4081.012 1138.793 / 2516.119
+step latency p50 / p95 ms         29.574 / 31.064    15.664 / 22.949
+mixed Prefill/Decode fraction             0.440              0.440
+```
+
+Direct Paged Decode improves aggregate output throughput by 1.69x and request
+throughput by 1.69x. Although Prefill remains eager, shorter Decode steps also
+reduce queueing around Prefill, improving TTFT and request latency.
+
+The Paged closed-loop throughput curve is:
+
+```text
+concurrency   output tok/s   inter-token p50 ms   TTFT p50 ms
+1                   140.26                 6.429        45.032
+4                   343.67                10.138        38.803
+8                   425.99                15.466        78.197
+16                  514.70                29.247       118.322
+```
+
+Throughput continues to rise through concurrency 16, but per-request latency
+also rises. QwenAttention currently launches one Paged operator per Decode
+request per layer, so a packed batched Paged Decode operator is the next
+system-level throughput boundary.
+
+## vLLM golden baseline
+
+The production-grade system target is recorded in
+[`vllm_golden.md`](vllm_golden.md). It uses an isolated vLLM 0.26.0 environment
+and a matched fixed workload of 512 Prompt tokens, 64 output tokens, greedy
+sampling, a 512-token batch budget, and concurrency 1/4/8/16.
+
+On the RTX 4090, einf Paged/Split-KV reaches
+139.86/363.06/473.37/571.57 output tokens/s, while vLLM reaches
+483.63/1858.98/3519.50/5301.21 tokens/s. The gap grows from 3.46x at concurrency
+1 to 9.27x at concurrency 16. This is a system-level upper target rather than a
+kernel-only comparison: vLLM uses FlashAttention Prefill, batched Paged Decode,
+compiled/fused model execution, and CUDA Graphs.

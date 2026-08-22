@@ -16,7 +16,11 @@ from einf.executors.torch.model_runner import (
     build_causal_mask,
     repeat_kv,
 )
-from einf.executors.torch.ops import flash_attention
+from einf.executors.torch.ops import (
+    flash_attention,
+    paged_decode_attention,
+    paged_decode_attention_split_kv,
+)
 from einf.executors.torch.output import ModelOutput
 
 
@@ -116,6 +120,8 @@ class QwenAttention(nn.Module):
         layer_idx: int,
         *,
         use_flash_attention: bool = False,
+        use_paged_decode_attention: bool = False,
+        paged_decode_max_splits: int = 64,
     ) -> None:
         super().__init__()
         if config.num_attention_heads % config.num_key_value_heads != 0:
@@ -128,6 +134,8 @@ class QwenAttention(nn.Module):
         self.num_key_value_groups = config.num_key_value_groups
         self.head_dim = config.head_dim
         self.use_flash_attention = use_flash_attention
+        self.use_paged_decode_attention = use_paged_decode_attention
+        self.paged_decode_max_splits = paged_decode_max_splits
 
         attention_size = config.num_attention_heads * config.head_dim
         kv_size = config.num_key_value_heads * config.head_dim
@@ -182,6 +190,36 @@ class QwenAttention(nn.Module):
             context_len = int(model_input.context_lens[request_idx].item())
 
             request_Q = Q[query_start:query_end]
+            if self.use_paged_decode_attention and q_len == 1:
+                K_cache, V_cache = cache.layer_cache(self.layer_idx)
+                num_logical_blocks = math.ceil(
+                    context_len / cache.geometry.block_len
+                )
+                num_splits = min(
+                    self.paged_decode_max_splits,
+                    max(1, num_logical_blocks // 4),
+                )
+                paged_args = (
+                    request_Q[0].contiguous(),
+                    K_cache,
+                    V_cache,
+                    model_input.block_tables[request_idx],
+                    context_len,
+                )
+                if num_splits == 1:
+                    output = paged_decode_attention(
+                        *paged_args,
+                        scale=1.0 / math.sqrt(self.head_dim),
+                    )
+                else:
+                    output = paged_decode_attention_split_kv(
+                        *paged_args,
+                        num_splits=num_splits,
+                        scale=1.0 / math.sqrt(self.head_dim),
+                    )
+                request_outputs.append(output.reshape(1, -1))
+                continue
+
             context_K, context_V = cache.gather_context(
                 self.layer_idx,
                 model_input.block_tables[request_idx],
@@ -234,12 +272,16 @@ class QwenDecoderLayer(nn.Module):
         layer_idx: int,
         *,
         use_flash_attention: bool = False,
+        use_paged_decode_attention: bool = False,
+        paged_decode_max_splits: int = 64,
     ) -> None:
         super().__init__()
         self.self_attn = QwenAttention(
             config,
             layer_idx,
             use_flash_attention=use_flash_attention,
+            use_paged_decode_attention=use_paged_decode_attention,
+            paged_decode_max_splits=paged_decode_max_splits,
         )
         self.mlp = QwenMLP(config)
         self.input_layernorm = QwenRMSNorm(
@@ -282,6 +324,8 @@ class QwenBackbone(nn.Module):
         config: QwenConfig,
         *,
         use_flash_attention: bool = False,
+        use_paged_decode_attention: bool = False,
+        paged_decode_max_splits: int = 64,
     ) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -290,6 +334,8 @@ class QwenBackbone(nn.Module):
                 config,
                 layer_idx,
                 use_flash_attention=use_flash_attention,
+                use_paged_decode_attention=use_paged_decode_attention,
+                paged_decode_max_splits=paged_decode_max_splits,
             )
             for layer_idx in range(config.num_hidden_layers)
         )
@@ -307,6 +353,8 @@ class QwenModelRunner(nn.Module):
         *,
         cache: TorchKVCacheStorage,
         use_flash_attention: bool = False,
+        use_paged_decode_attention: bool = False,
+        paged_decode_max_splits: int = 64,
     ) -> None:
         super().__init__()
         geometry = cache.geometry
@@ -318,12 +366,24 @@ class QwenModelRunner(nn.Module):
             raise ValueError("cache geometry must match Qwen configuration")
         if use_flash_attention and config.head_dim != 64:
             raise ValueError("FlashAttention v0 requires head_dim == 64")
+        if use_paged_decode_attention:
+            if not cache.K.is_cuda:
+                raise ValueError("Paged Decode Attention requires CUDA cache storage")
+            if config.head_dim % 32 != 0 or config.head_dim > 256:
+                raise ValueError(
+                    "Paged Decode Attention requires head_dim to be a multiple "
+                    "of 32 and no greater than 256"
+                )
+            if paged_decode_max_splits <= 0:
+                raise ValueError("paged_decode_max_splits must be positive")
 
         self.config = config
         self.cache = cache
         self.model = QwenBackbone(
             config,
             use_flash_attention=use_flash_attention,
+            use_paged_decode_attention=use_paged_decode_attention,
+            paged_decode_max_splits=paged_decode_max_splits,
         )
         self.lm_head = nn.Linear(
             config.hidden_size,

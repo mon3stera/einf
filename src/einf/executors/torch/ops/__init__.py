@@ -35,6 +35,48 @@ def contiguous_attention(Q, K, V, start_pos: int, scale: float):
     )
 
 
+def cute_copy(input):
+    """Run the first CuTe Global-to-Register-to-Global copy exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_copy(input)
+
+
+def cute_elementwise_add(X, Y):
+    """Run the arbitrary-length CuTe element-wise addition exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_elementwise_add(X, Y)
+
+
+def cute_gemm(A, B):
+    """Run the arbitrary-shape FP32 CuTe SIMT GEMM exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_gemm(A, B)
+
+
+def cute_mma_qk(Q, K):
+    """Run the one-Warp CuTe BF16 m16n8k16 QK learning exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_mma_qk(Q, K)
+
+
+def cute_reduce_sum(input):
+    """Run the arbitrary-length CuTe FP32 reduction exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_reduce_sum(input)
+
+
+def cute_shared_copy(input):
+    """Run the CuTe Global-to-Shared-to-Global copy exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_shared_copy(input)
+
+
+def cute_transpose(input):
+    """Run the CuTe Shared-Memory tiled transpose exercise."""
+    load_custom_ops()
+    return torch.ops.einf.cute_transpose(input)
+
+
 def flash_attention(Q, K, V, start_pos: int, scale: float):
     """Run the correctness-first FlashAttention-style forward operator."""
     load_custom_ops()
@@ -45,6 +87,12 @@ def flash_attention(Q, K, V, start_pos: int, scale: float):
         start_pos,
         scale,
     )
+
+
+def tensor_core_qk(Q, K):
+    """Run the BF16 Tensor Core QK learning operator."""
+    load_custom_ops()
+    return torch.ops.einf.tensor_core_qk(Q, K)
 
 
 def paged_decode_attention(
@@ -89,13 +137,46 @@ def paged_decode_attention_split_kv(
     )
 
 
+def paged_decode_attention_batched(
+    query,
+    K_cache,
+    V_cache,
+    block_tables,
+    context_lens,
+    query_start_loc,
+    single_query_request_indices,
+    scale: float,
+):
+    """Run the packed mixed-batch Paged Decode learning operator."""
+    load_custom_ops()
+    return torch.ops.einf.paged_decode_attention_batched(
+        query,
+        K_cache,
+        V_cache,
+        block_tables,
+        context_lens,
+        query_start_loc,
+        single_query_request_indices,
+        scale,
+    )
+
+
 __all__ = [
     "contiguous_attention",
+    "cute_copy",
+    "cute_elementwise_add",
+    "cute_gemm",
+    "cute_mma_qk",
+    "cute_reduce_sum",
+    "cute_shared_copy",
+    "cute_transpose",
     "custom_ops_available",
     "flash_attention",
     "gather_context",
     "load_custom_ops",
+    "paged_decode_attention_batched",
     "paged_decode_attention",
     "paged_decode_attention_split_kv",
+    "tensor_core_qk",
     "write_slots_",
 ]

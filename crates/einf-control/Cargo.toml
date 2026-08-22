@@ -1,0 +1,13 @@
+[package]
+name = "einf-control"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Rust control plane for the einf learning inference engine"
+license = "MIT"
+
+[lib]
+name = "einf_control"
+path = "src/lib.rs"
+
+[dependencies]

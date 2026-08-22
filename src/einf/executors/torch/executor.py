@@ -1,7 +1,7 @@
 from einf.execution import ExecutionResult, Executor, RequestExecutionResult
 
 from einf.executors.torch.input import ModelInput
-from einf.scheduler import ScheduledBatch
+from einf.execution_plan import BatchPlan
 import torch
 
 class TorchExecutor(Executor):
@@ -11,7 +11,7 @@ class TorchExecutor(Executor):
         self._eos_token_id = eos_token_id
         self._device = device
 
-    def execute(self, batch: ScheduledBatch) -> ExecutionResult:
+    def execute(self, batch: BatchPlan) -> ExecutionResult:
         input = ModelInput.from_batch(batch, block_len=self._block_len, device=self._device)
 
         output = self._model_runner.forward(input)

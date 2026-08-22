@@ -4,12 +4,21 @@ from torch.utils.cpp_extension import CUDA_HOME
 
 from einf.executors.torch.ops import (
     contiguous_attention,
+    cute_copy,
+    cute_elementwise_add,
+    cute_gemm,
+    cute_mma_qk,
+    cute_reduce_sum,
+    cute_shared_copy,
+    cute_transpose,
     custom_ops_available,
     flash_attention,
     gather_context,
     load_custom_ops,
+    paged_decode_attention_batched,
     paged_decode_attention,
     paged_decode_attention_split_kv,
+    tensor_core_qk,
     write_slots_,
 )
 
@@ -78,9 +87,265 @@ def test_custom_ops_extension_registers_write_slots_schema() -> None:
     assert hasattr(torch.ops.einf, "write_slots_")
     assert hasattr(torch.ops.einf, "gather_context")
     assert hasattr(torch.ops.einf, "contiguous_attention")
+    assert hasattr(torch.ops.einf, "cute_copy")
+    assert hasattr(torch.ops.einf, "cute_elementwise_add")
+    assert hasattr(torch.ops.einf, "cute_gemm")
+    assert hasattr(torch.ops.einf, "cute_mma_qk")
+    assert hasattr(torch.ops.einf, "cute_reduce_sum")
+    assert hasattr(torch.ops.einf, "cute_shared_copy")
+    assert hasattr(torch.ops.einf, "cute_transpose")
     assert hasattr(torch.ops.einf, "flash_attention")
+    assert hasattr(torch.ops.einf, "tensor_core_qk")
     assert hasattr(torch.ops.einf, "paged_decode_attention")
     assert hasattr(torch.ops.einf, "paged_decode_attention_split_kv")
+    assert hasattr(torch.ops.einf, "paged_decode_attention_batched")
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+@pytest.mark.parametrize(
+    ("rows", "cols"),
+    [
+        (128, 64),
+        (256, 64),
+        (128, 128),
+        (256, 128),
+    ],
+)
+def test_cute_copy_matches_input(rows: int, cols: int) -> None:
+    input = torch.randn((rows, cols), device="cuda", dtype=torch.float32)
+
+    actual = cute_copy(input)
+
+    torch.testing.assert_close(actual, input, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+@pytest.mark.parametrize(
+    ("rows", "cols"),
+    [
+        (128, 64),
+        (256, 64),
+        (128, 128),
+        (256, 128),
+    ],
+)
+def test_cute_shared_copy_matches_input(rows: int, cols: int) -> None:
+    input = torch.randn((rows, cols), device="cuda", dtype=torch.float32)
+
+    actual = cute_shared_copy(input)
+
+    torch.testing.assert_close(actual, input, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+@pytest.mark.parametrize(
+    ("rows", "cols"),
+    [
+        (64, 64),
+        (128, 64),
+        (64, 128),
+        (128, 192),
+    ],
+)
+def test_cute_transpose_matches_torch(rows: int, cols: int) -> None:
+    input = torch.randn((rows, cols), device="cuda", dtype=torch.float32)
+
+    actual = cute_transpose(input)
+
+    torch.testing.assert_close(actual, input.T.contiguous(), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (),
+        (0,),
+        (1,),
+        (31,),
+        (32,),
+        (33,),
+        (255,),
+        (256,),
+        (257,),
+        (1000,),
+        (3, 5, 7),
+        (2, 0, 3),
+    ],
+)
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+def test_cute_elementwise_add_matches_torch(shape: tuple[int, ...]) -> None:
+    X = torch.randn(shape, device="cuda", dtype=torch.float32)
+    Y = torch.randn_like(X)
+
+    actual = cute_elementwise_add(X, Y)
+
+    assert actual.shape == X.shape
+    torch.testing.assert_close(actual, X + Y, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (),
+        (0,),
+        (1,),
+        (31,),
+        (32,),
+        (33,),
+        (255,),
+        (256,),
+        (257,),
+        (1000,),
+        (1_000_000,),
+        (3, 5, 7),
+        (2, 0, 3),
+    ],
+)
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+def test_cute_reduce_sum_matches_torch(shape: tuple[int, ...]) -> None:
+    numel = torch.Size(shape).numel()
+    input = (
+        torch.arange(numel, device="cuda", dtype=torch.float32)
+        .remainder(17)
+        .sub(8)
+        .reshape(shape)
+    )
+
+    actual = cute_reduce_sum(input)
+
+    assert actual.shape == torch.Size([])
+    torch.testing.assert_close(actual, input.sum(), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+@pytest.mark.parametrize(
+    ("M", "K", "N"),
+    [
+        (4, 4, 4),
+        (16, 16, 16),
+        (64, 32, 64),
+        (68, 20, 76),
+        (128, 64, 128),
+        (128, 96, 128),
+        (4, 0, 8),
+        (0, 4, 8),
+        (8, 4, 0),
+    ],
+)
+def test_cute_gemm_matches_torch(M: int, K: int, N: int) -> None:
+    A = (
+        torch.arange(M * K, device="cuda", dtype=torch.float32)
+        .remainder(11)
+        .sub(5)
+        .reshape(M, K)
+    )
+    B = (
+        torch.arange(K * N, device="cuda", dtype=torch.float32)
+        .remainder(13)
+        .sub(6)
+        .reshape(K, N)
+    )
+
+    actual = cute_gemm(A, B)
+    expected = A @ B
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+@pytest.mark.parametrize(
+    ("M", "K", "N"),
+    [
+        (5, 4, 4),
+        (4, 5, 4),
+        (4, 4, 5),
+    ],
+)
+def test_cute_gemm_rejects_partial_vectors(M: int, K: int, N: int) -> None:
+    A = torch.empty((M, K), device="cuda", dtype=torch.float32)
+    B = torch.empty((K, N), device="cuda", dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="divisible by 4"):
+        cute_gemm(A, B)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+def test_cute_mma_qk_learning_scaffold() -> None:
+    Q = torch.randn((16, 16), device="cuda", dtype=torch.bfloat16)
+    K = torch.randn((8, 16), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="learning scaffold"):
+        cute_mma_qk(Q, K)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "num_attention_heads", "num_kv_heads"),
+    [
+        (16, 16, 4, 2),
+        (128, 32, 4, 2),
+        (144, 64, 14, 2),
+        (256, 16, 8, 8),
+    ],
+)
+def test_tensor_core_qk_matches_pytorch(
+    q_len: int,
+    kv_len: int,
+    num_attention_heads: int,
+    num_kv_heads: int,
+) -> None:
+    torch.manual_seed(71)
+    Q = torch.randn(
+        (q_len, num_attention_heads, 64),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    K = torch.randn(
+        (kv_len, num_kv_heads, 64),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    group_size = num_attention_heads // num_kv_heads
+    kv_head_indices = torch.arange(num_attention_heads, device="cuda") // group_size
+    expected = torch.einsum(
+        "qhd,khd->qhk",
+        Q.float(),
+        K[:, kv_head_indices, :].float(),
+    )
+
+    actual = tensor_core_qk(Q, K)
+
+    assert actual.dtype == torch.float32
+    assert actual.shape == (q_len, num_attention_heads, kv_len)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(
@@ -123,6 +388,40 @@ def test_paged_decode_attention_split_kv_matches_pytorch(
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
     else:
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+def test_paged_decode_attention_batched_learning_scaffold() -> None:
+    query = torch.randn((2, 4, 64), device="cuda", dtype=torch.float32)
+    K_cache = torch.randn((4, 4, 2, 64), device="cuda", dtype=torch.float32)
+    V_cache = torch.randn_like(K_cache)
+    block_tables = torch.tensor(
+        [[2, 0], [3, 1]],
+        device="cuda",
+        dtype=torch.long,
+    )
+    context_lens = torch.tensor([5, 7], device="cuda", dtype=torch.long)
+    query_start_loc = torch.tensor([0, 1, 2], device="cuda", dtype=torch.long)
+    single_query_request_indices = torch.tensor(
+        [0, 1],
+        device="cuda",
+        dtype=torch.long,
+    )
+
+    with pytest.raises(RuntimeError, match="learning scaffold"):
+        paged_decode_attention_batched(
+            query,
+            K_cache,
+            V_cache,
+            block_tables,
+            context_lens,
+            query_start_loc,
+            single_query_request_indices,
+            query.shape[-1] ** -0.5,
+        )
 
 
 @pytest.mark.skipif(

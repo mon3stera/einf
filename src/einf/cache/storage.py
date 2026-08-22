@@ -51,6 +51,13 @@ class TorchKVCacheStorage:
             self.geometry.head_dim,
         )
 
+    def layer_cache(self, layer_idx: int) -> tuple[Tensor, Tensor]:
+        """Return one layer's paged K/V cache views for direct Attention ops."""
+        return (
+            self._layer_cache(self.K, layer_idx),
+            self._layer_cache(self.V, layer_idx),
+        )
+
     def write_slots(
         self,
         layer_idx: int,

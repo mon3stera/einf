@@ -13,9 +13,18 @@ _REQUIRED_OPS = (
     "write_slots_",
     "gather_context",
     "contiguous_attention",
+    "cute_copy",
+    "cute_elementwise_add",
+    "cute_gemm",
+    "cute_mma_qk",
+    "cute_reduce_sum",
+    "cute_shared_copy",
+    "cute_transpose",
     "flash_attention",
+    "tensor_core_qk",
     "paged_decode_attention",
     "paged_decode_attention_split_kv",
+    "paged_decode_attention_batched",
 )
 
 
@@ -40,7 +49,26 @@ def load_custom_ops(*, verbose: bool = False) -> None:
             _LOADED = True
             return
 
-        csrc = Path(__file__).resolve().parent / "csrc"
+        ops_dir = Path(__file__).resolve().parent
+        csrc = ops_dir / "csrc"
+        project_root = next(
+            (
+                parent
+                for parent in ops_dir.parents
+                if (parent / "pyproject.toml").is_file()
+            ),
+            None,
+        )
+        if project_root is None:
+            raise RuntimeError("could not locate the einf project root for CUTLASS")
+
+        cutlass_include = project_root / "third_party" / "cutlass" / "include"
+        if not (cutlass_include / "cute" / "tensor.hpp").is_file():
+            raise RuntimeError(
+                "CUTLASS/CuTe headers are missing; run "
+                "`git submodule update --init third_party/cutlass`"
+            )
+
         sources = [
             str(csrc / "kv_cache.cpp"),
             str(csrc / "kv_cache_cuda.cu"),
@@ -48,19 +76,38 @@ def load_custom_ops(*, verbose: bool = False) -> None:
             str(csrc / "gather_context_cuda.cu"),
             str(csrc / "contiguous_attention.cpp"),
             str(csrc / "contiguous_attention_cuda.cu"),
+            str(csrc / "cute_copy.cpp"),
+            str(csrc / "cute_copy_cuda.cu"),
+            str(csrc / "cute_elementwise_add.cpp"),
+            str(csrc / "cute_elementwise_add_cuda.cu"),
+            str(csrc / "cute_gemm.cpp"),
+            str(csrc / "cute_gemm_cuda.cu"),
+            str(csrc / "cute_mma_qk.cpp"),
+            str(csrc / "cute_mma_qk_cuda.cu"),
+            str(csrc / "cute_reduce_sum.cpp"),
+            str(csrc / "cute_reduce_sum_cuda.cu"),
+            str(csrc / "cute_shared_copy.cpp"),
+            str(csrc / "cute_shared_copy_cuda.cu"),
+            str(csrc / "cute_transpose.cpp"),
+            str(csrc / "cute_transpose_cuda.cu"),
             str(csrc / "flash_attention.cpp"),
             str(csrc / "flash_attention_cuda.cu"),
+            str(csrc / "tensor_core_qk.cpp"),
+            str(csrc / "tensor_core_qk_cuda.cu"),
             str(csrc / "paged_attention.cpp"),
             str(csrc / "paged_attention_cuda.cu"),
             str(csrc / "paged_attention_split_kv.cpp"),
             str(csrc / "paged_attention_split_kv_cuda.cu"),
+            str(csrc / "paged_attention_batched.cpp"),
+            str(csrc / "paged_attention_batched_cuda.cu"),
         ]
 
         load(
             name=_EXTENSION_NAME,
             sources=sources,
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "-lineinfo"],
+            extra_include_paths=[str(cutlass_include)],
             with_cuda=True,
             is_python_module=False,
             verbose=verbose,

@@ -10,4 +10,7 @@ dist/
 benchmark-results/
 target/
 *.so
+*.cubin
+*.bak
+*.ncu-rep
 third_party/

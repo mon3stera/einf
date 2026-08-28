@@ -104,6 +104,80 @@ chunked Prefill uses the same tail-aligned causality as einf. Use `--quick`
 while iterating on kernels and `--include-naive` only when the expensive
 three-kernel oracle timing is needed.
 
+### CuTe DSL versus production Flash SDPA
+
+Use the dedicated repeated paired benchmark while developing the CuTe DSL
+FlashAttention kernel:
+
+```bash
+python benchmarks/benchmark_cute_flash_attention.py --quick
+```
+
+The comparison target is PyTorch's production Flash Attention backend, forced with
+`sdpa_kernel(SDPBackend.FLASH_ATTENTION)`. Inputs use `causal_lower_right` and
+`enable_gqa=True`, matching the CuTe kernel's lower-right-causal GQA contract. A
+profiler verification on the RTX environment reported
+`aten::_scaled_dot_product_flash_attention`, `aten::_flash_attention_forward`, and
+`pytorch_flash::flash_fwd_splitkv_*` kernels rather than a math fallback.
+
+The default matrix covers aligned full-Prefill and chunked-Prefill shapes. Use a
+targeted matrix with, for example, `--cases 64x512,128x2048`. The current CuTe
+contract requires `q_len % 64 == 0`, `kv_len % 16 == 0`, BF16, and `D=64`.
+The default geometry is `Hq=14,Hkv=2`, `block_m=64`, `block_n=16`, and four
+Split-Q warps, so each warp owns 16 consecutive Q rows.
+
+The benchmark compiles `_flash_attention_launch` explicitly with `cute.compile`,
+passing `(block_m, block_n, head_dim, num_warps)` as `cutlass.Constexpr`
+specialization arguments. The public wrapper currently selects the verified
+default `(64, 16, 64, 4)`; direct launch callers can compile other
+SM80-compatible configurations without editing the kernel. The m16n8k16
+back-to-back GEMM path requires positive `block_m % 16 == 0`,
+`block_n % 16 == 0`, and `head_dim % 16 == 0`. Split-Q additionally requires
+`num_warps` in `{1,2,4,8}` and `(block_m / num_warps) % 16 == 0`. Each new
+combination still requires correctness and resource/performance validation. The
+benchmark exposes `--block-m`, `--block-n`, `--head-dim`, and `--num-warps`, and
+records both `num_warps` and `m_per_warp` in CSV. It reuses one CuTe output
+allocation and times only the compiled callable. Calling
+the learning-oriented CuTe Python wrapper directly performs compile/dispatch work
+on every invocation and is not a kernel latency measurement. CuTe compile/JIT,
+correctness checks, and warmup are excluded. Each shape uses 20 interleaved warmups
+followed by nine order-alternating paired rounds of 100 calls. The report includes
+medians, ranges, every raw sample, optional CSV output, and
+`paired_x = sdpa_us / cute_us`: greater than one favors CuTe and less than one
+favors Flash SDPA. Store generated CSV files under the ignored
+`benchmark-results/` directory, for example
+`--csv benchmark-results/cute-fa-vs-sdpa-pre-splitq.csv`.
+
+#### RTX 4090 pre-Split-Q baseline
+
+Environment: PyTorch 2.10.0+cu128, CuTe DSL 4.4.1, CUDA 12.1 toolkit selected for
+the process, RTX 4090, BF16, `Hq=14`, `Hkv=2`, `D=64`, 20 warmups, 100 calls per
+sample, and nine same-session paired rounds. CuTe source SHA256 was
+`18a71d1fec6562d7f62370833107ff11bd83cf2be5a9deb455c99ee68417ed7d`.
+
+```text
+              case   cute_us  sdpa_us  paired_x  cute_TF  sdpa_TF
+        prefill-32     6.714    8.806     1.216     0.28     0.21
+       prefill-128    14.394    8.966     0.594     2.06     3.30
+       prefill-512    47.739   17.448     0.365     9.86    26.98
+      prefill-2048   286.280  110.702     0.387    26.27    67.93
+      prefill-4096   894.321  299.981     0.336    33.63   100.25
+      chunk-32/512    41.433   14.706     0.306     1.37     3.87
+     chunk-32/2048   153.999   14.428     0.094     1.51    16.16
+     chunk-32/8192   604.232   26.489     0.044     1.55    35.40
+    chunk-128/2048   153.836   16.835     0.109     5.92    54.08
+```
+
+Latency columns are medians. Effective TFLOP/s count QK and P@V over
+mathematically visible lower-right-causal pairs; softmax work and tile padding are
+excluded. All nine correctness comparisons passed before timing; the largest
+observed absolute CuTe/SDPA output difference was `0.00390625`. CuTe wins only the
+smallest 32-token Prefill case. The largest gaps are short-Q/long-KV workloads,
+where production SDPA can dispatch Split-KV while the pre-Split-Q CuTe kernel gave
+one serial KV scan to each `(Q tile, query head)` warp. This table remains the
+historical pre-Split-Q baseline; rerun the same paired protocol for the four-warp
+implementation rather than comparing timings across sessions.
+
 ### RTX 4090 BF16 baseline
 
 Environment: PyTorch 2.10.0+cu128, CUDA 12.8, `Hq=14`, `Hkv=2`, `D=64`, 20

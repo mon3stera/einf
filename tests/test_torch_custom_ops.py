@@ -294,12 +294,40 @@ def test_cute_gemm_rejects_partial_vectors(M: int, K: int, N: int) -> None:
     CUDA_HOME is None or not torch.cuda.is_available(),
     reason="CUDA build/runtime is unavailable",
 )
-def test_cute_mma_qk_learning_scaffold() -> None:
+@pytest.mark.parametrize("seed", [0, 71, 1234])
+def test_cute_mma_qk_matches_pytorch(seed: int) -> None:
+    torch.manual_seed(seed)
     Q = torch.randn((16, 16), device="cuda", dtype=torch.bfloat16)
     K = torch.randn((8, 16), device="cuda", dtype=torch.bfloat16)
 
-    with pytest.raises(RuntimeError, match="learning scaffold"):
-        cute_mma_qk(Q, K)
+    # A single m16n8k16 BF16 atom computes C[m, n] = sum_k Q[m, k] * K[n, k]
+    # with FP32 accumulation, i.e. Q @ K^T. The reference is evaluated in
+    # FP64 so the only expected difference is FP32 accumulation rounding.
+    expected = (Q.double() @ K.double().transpose(0, 1)).float()
+
+    actual = cute_mma_qk(Q, K)
+
+    assert actual.dtype == torch.float32
+    assert actual.shape == (16, 8)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(
+    CUDA_HOME is None or not torch.cuda.is_available(),
+    reason="CUDA build/runtime is unavailable",
+)
+def test_cute_mma_qk_rejects_unsupported_inputs() -> None:
+    Q = torch.randn((16, 16), device="cuda", dtype=torch.bfloat16)
+    K = torch.randn((8, 16), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="requires BF16"):
+        cute_mma_qk(Q.float(), K.float())
+
+    with pytest.raises(RuntimeError, match=r"Q shape \[16,16\]"):
+        cute_mma_qk(torch.randn((8, 16), device="cuda", dtype=torch.bfloat16), K)
+
+    with pytest.raises(RuntimeError, match=r"K shape \[8,16\]"):
+        cute_mma_qk(Q, torch.randn((16, 16), device="cuda", dtype=torch.bfloat16))
 
 
 @pytest.mark.skipif(

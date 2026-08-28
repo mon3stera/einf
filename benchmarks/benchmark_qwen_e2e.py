@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -18,7 +19,9 @@ from einf.request import RequestSpec, RequestState
 from einf.scheduler import Scheduler
 
 
-DEFAULT_MODEL_DIR = Path("/home/wyg/python/models/Qwen2.5-0.5B")
+DEFAULT_MODEL_DIR = Path(
+    os.environ.get("EINF_MODEL_DIR", "~/models/Qwen2.5-0.5B")
+).expanduser()
 DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,

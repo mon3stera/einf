@@ -319,7 +319,6 @@ __global__ void paged_decode_attention_split_kv_reduce_kernel(
         acc[step].y = acc[step].y * alpha + v.y * beta;
       }
     }
-
   }
 
   l = __shfl_sync(0xffffffff, l, 0);

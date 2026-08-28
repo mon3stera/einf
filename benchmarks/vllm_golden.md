@@ -1,5 +1,11 @@
 # vLLM golden serving baseline
 
+> **Superseded for current work.** These numbers predate the Rust/PyO3
+> control-plane migration and were measured on the previous 4090 host (now
+> failed) against vLLM 0.26.0 in an isolated venv. The current, stack-matched
+> re-measurement is `post-migration-2026-08-23.md`. This file is kept as the
+> historical record and for its methodology.
+
 This benchmark is the production-grade upper reference for einf. It is not a
 kernel-only comparison: vLLM contributes FlashAttention Prefill, batched Paged
 Decode, fused model kernels, CUDA Graphs, compilation, and a mature serving

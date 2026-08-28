@@ -24,6 +24,26 @@ from einf.executors.torch.ops import (
 from einf.executors.torch.output import ModelOutput
 
 
+def choose_num_splits(num_logical_blocks: int, max_splits: int) -> int:
+    """Pick the Split-KV count for one single-Query decode request.
+
+    Measured optima on an RTX 4090 with Qwen2.5-0.5B geometry
+    (``benchmarks/micro-paged-decode-2026-08-23.md``), as logical blocks -> splits:
+    8 -> 8, 34 -> 16, 64 -> 16, 128 -> 32, 256 -> 64, 512 -> 64, 1024 -> 64.
+
+    The floor of 16 matters at short context, where ``// 4`` alone under-splits and
+    the resulting grid of ``num_attention_heads * num_splits`` CTAs cannot fill the
+    device: at context 544 it produced 112 CTAs for 128 SMs and left 1.31x on the
+    table. The cap matters in the other direction, because the merge kernel is a
+    single-warp serial loop over splits, so its cost grows linearly with them and
+    eventually dominates the call.
+
+    The result always lies in ``[1, num_logical_blocks]``, which is what the
+    operator's ``num_splits <= num_logical_blocks`` precondition requires.
+    """
+    return min(max_splits, max(min(num_logical_blocks, 16), num_logical_blocks // 4))
+
+
 @dataclass(frozen=True, slots=True)
 class QwenConfig:
     vocab_size: int
@@ -183,11 +203,11 @@ class QwenAttention(nn.Module):
         )
 
         request_outputs = []
-        for request_idx in range(model_input.query_start_loc.numel() - 1):
-            query_start = int(model_input.query_start_loc[request_idx].item())
-            query_end = int(model_input.query_start_loc[request_idx + 1].item())
+        for request_idx in range(len(model_input.query_start_loc_host) - 1):
+            query_start = model_input.query_start_loc_host[request_idx]
+            query_end = model_input.query_start_loc_host[request_idx + 1]
             q_len = query_end - query_start
-            context_len = int(model_input.context_lens[request_idx].item())
+            context_len = model_input.context_lens_host[request_idx]
 
             request_Q = Q[query_start:query_end]
             if self.use_paged_decode_attention and q_len == 1:
@@ -195,9 +215,9 @@ class QwenAttention(nn.Module):
                 num_logical_blocks = math.ceil(
                     context_len / cache.geometry.block_len
                 )
-                num_splits = min(
+                num_splits = choose_num_splits(
+                    num_logical_blocks,
                     self.paged_decode_max_splits,
-                    max(1, num_logical_blocks // 4),
                 )
                 paged_args = (
                     request_Q[0].contiguous(),

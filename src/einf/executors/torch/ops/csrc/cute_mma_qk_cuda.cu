@@ -30,11 +30,21 @@ __global__ void cute_mma_qk_kernel(
   auto tiled_mma = make_tiled_mma(MmaAtom{});
   auto thread_mma = tiled_mma.get_slice(threadIdx.x);
 
-  (void)Q;
-  (void)K;
-  (void)scores;
-  (void)thread_mma;
+  auto tQgQ = thread_mma.partition_A(Q);
+  auto tKgK = thread_mma.partition_B(K);
+  auto tSgS = thread_mma.partition_C(scores);
 
+  auto tQrQ = thread_mma.partition_fragment_A(Q);
+  auto tKrK = thread_mma.partition_fragment_B(K);
+  auto tSrS = thread_mma.partition_fragment_C(scores);
+
+  copy(tQgQ, tQrQ);
+  copy(tKgK, tKrK);
+  clear(tSrS);
+
+  gemm(tiled_mma, tQrQ, tKrK, tSrS);
+  copy(tSrS, tSgS);
+  
   // Learning task 4:
   // 1. Partition Global Q/K/scores with thread_mma.partition_A/B/C().
   // 2. Create Register fragments compatible with those partitions.
@@ -86,11 +96,6 @@ at::Tensor cute_mma_qk_cuda(
   const dim3 blocks(1);
   const dim3 threads(kWarpSize);
   const auto stream = at::cuda::getCurrentCUDAStream(Q.get_device());
-
-  TORCH_CHECK(
-      false,
-      "einf::cute_mma_qk learning scaffold: partition Q/K/scores, create "
-      "Register fragments, and execute one CuTe BF16 MMA atom");
 
   cute_mma_qk_kernel<<<blocks, threads, 0, stream>>>(
       q_tensor,

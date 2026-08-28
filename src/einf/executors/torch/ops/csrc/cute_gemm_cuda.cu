@@ -5,7 +5,6 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_runtime.h>
-
 #include <cute/tensor.hpp>
 
 namespace einf::ops {
@@ -23,6 +22,7 @@ constexpr int kCopyTileBN = 64;
 constexpr int kMMATileM = 16;
 constexpr int kMMATileN = 16;
 constexpr int kStages = 2;
+constexpr int kL2TileSize = 8;
 
 template <int VectorWidth, class ThrCopy, class GlobalTile, class CoordTile>
 CUTE_DEVICE auto build_copy_source_and_predicate(
@@ -51,8 +51,35 @@ CUTE_DEVICE auto build_copy_source_and_predicate(
 template <int BlockM, int BlockN, int BlockK, class ATensor, class BTensor,
           class CTensor>
 __global__ void cute_gemm_kernel(ATensor A, BTensor B, CTensor C, int64_t M,
-                                 int64_t N, int64_t K) {
+                                 int64_t N, int64_t K, int64_t num_m_tiles,
+                                 int64_t num_n_tiles) {
   using namespace cute;
+
+  // Group CTAs into an 8-tile L2 macro-tile along the longer grid axis.
+  // This changes only traversal order: every logical (block_m, block_n) tile
+  // is still visited exactly once, while reusable A/B panels are revisited
+  // sooner than with a full row/column sweep.
+  const int64_t pid = static_cast<int64_t>(blockIdx.x) +
+                      static_cast<int64_t>(gridDim.x) * blockIdx.y;
+  int64_t block_m;
+  int64_t block_n;
+  if (num_m_tiles >= num_n_tiles) {
+    const int64_t group_span = int64_t{kL2TileSize} * num_n_tiles;
+    const int64_t first_m = (pid / group_span) * kL2TileSize;
+    const int64_t actual_m =
+        min(int64_t{kL2TileSize}, num_m_tiles - first_m);
+    const int64_t pid_in_group = pid % group_span;
+    block_m = first_m + pid_in_group % actual_m;
+    block_n = pid_in_group / actual_m;
+  } else {
+    const int64_t group_span = int64_t{kL2TileSize} * num_m_tiles;
+    const int64_t first_n = (pid / group_span) * kL2TileSize;
+    const int64_t actual_n =
+        min(int64_t{kL2TileSize}, num_n_tiles - first_n);
+    const int64_t pid_in_group = pid % group_span;
+    block_n = first_n + pid_in_group % actual_n;
+    block_m = pid_in_group / actual_n;
+  }
 
   __shared__ __align__(16) float shared_A[kStages * BlockM * BlockK];
   __shared__ __align__(16) float shared_B[kStages * BlockK * BlockN];
@@ -102,9 +129,9 @@ __global__ void cute_gemm_kernel(ATensor A, BTensor B, CTensor C, int64_t M,
   auto cB_tensor = make_identity_tensor(make_shape(K, N));
 
   auto cC_tensor = make_identity_tensor(make_shape(M, N));
-  auto gC_tile = local_tile(C, gC_shape, make_coord(blockIdx.x, blockIdx.y));
+  auto gC_tile = local_tile(C, gC_shape, make_coord(block_m, block_n));
   auto cC_tile =
-      local_tile(cC_tensor, gC_shape, make_coord(blockIdx.x, blockIdx.y));
+      local_tile(cC_tensor, gC_shape, make_coord(block_m, block_n));
 
   auto tiled_mma =
       make_tiled_mma(MMA_Atom<UniversalFMA<float>>{}, mma_thr_layout);
@@ -134,10 +161,10 @@ __global__ void cute_gemm_kernel(ATensor A, BTensor B, CTensor C, int64_t M,
   // Prologue: populate the first read stage. Each following iteration issues
   // the next Global-to-Shared copy before computing the current register tile.
   if (num_k_tiles > 0) {
-    auto gA_tile = local_tile(A, gA_shape, make_coord(blockIdx.x, 0));
-    auto gB_tile = local_tile(B, gB_shape, make_coord(0, blockIdx.y));
-    auto cA_tile = local_tile(cA_tensor, gA_shape, make_coord(blockIdx.x, 0));
-    auto cB_tile = local_tile(cB_tensor, gB_shape, make_coord(0, blockIdx.y));
+    auto gA_tile = local_tile(A, gA_shape, make_coord(block_m, 0));
+    auto gB_tile = local_tile(B, gB_shape, make_coord(0, block_n));
+    auto cA_tile = local_tile(cA_tensor, gA_shape, make_coord(block_m, 0));
+    auto cB_tile = local_tile(cB_tensor, gB_shape, make_coord(0, block_n));
 
     auto [tApA, tAgA] = build_copy_source_and_predicate<kVectorWidth>(
         thr_copy_a, gA_tile, cA_tile, M, K);
@@ -156,12 +183,12 @@ __global__ void cute_gemm_kernel(ATensor A, BTensor B, CTensor C, int64_t M,
     __syncthreads();
 
     if (k_next < num_k_tiles) {
-      auto gA_tile = local_tile(A, gA_shape, make_coord(blockIdx.x, k_next));
-      auto gB_tile = local_tile(B, gB_shape, make_coord(k_next, blockIdx.y));
+      auto gA_tile = local_tile(A, gA_shape, make_coord(block_m, k_next));
+      auto gB_tile = local_tile(B, gB_shape, make_coord(k_next, block_n));
       auto cA_tile =
-          local_tile(cA_tensor, gA_shape, make_coord(blockIdx.x, k_next));
+          local_tile(cA_tensor, gA_shape, make_coord(block_m, k_next));
       auto cB_tile =
-          local_tile(cB_tensor, gB_shape, make_coord(k_next, blockIdx.y));
+          local_tile(cB_tensor, gB_shape, make_coord(k_next, block_n));
 
       auto [tApA, tAgA] = build_copy_source_and_predicate<kVectorWidth>(
           thr_copy_a, gA_tile, cA_tile, M, K);
@@ -213,11 +240,19 @@ at::Tensor cute_gemm_cuda(const at::Tensor &A, const at::Tensor &B) {
   const auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
 
   const dim3 block(kNumThreads);
-  const dim3 grid(ceil_div(M, kBlockM), ceil_div(N, kBlockN));
+  const int64_t num_m_tiles = ceil_div(M, int64_t{kBlockM});
+  const int64_t num_n_tiles = ceil_div(N, int64_t{kBlockN});
+  const int64_t num_ctas = num_m_tiles * num_n_tiles;
+  constexpr int64_t kMaxGridX = 2147483647;
+  const int64_t grid_x = min(num_ctas, kMaxGridX);
+  const int64_t grid_y = num_ctas == 0 ? 1 : ceil_div(num_ctas, grid_x);
+  const dim3 grid(static_cast<unsigned>(grid_x),
+                  static_cast<unsigned>(grid_y));
 
   if (M != 0 && N != 0) {
     cute_gemm_kernel<kBlockM, kBlockN, kBlockK>
-        <<<grid, block, 0, stream>>>(a_tensor, b_tensor, c_tensor, M, N, K);
+        <<<grid, block, 0, stream>>>(a_tensor, b_tensor, c_tensor, M, N, K,
+                                    num_m_tiles, num_n_tiles);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 

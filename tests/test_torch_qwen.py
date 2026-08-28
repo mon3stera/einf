@@ -3,7 +3,7 @@ import torch
 
 from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
 from einf.executors.torch.input import ModelInput
-from einf.executors.torch.qwen import QwenConfig, QwenModelRunner
+from einf.executors.torch.qwen import QwenConfig, QwenModelRunner, choose_num_splits
 from einf.scheduler import ScheduledBatch, ScheduledRequest, WorkType
 
 
@@ -291,3 +291,36 @@ def test_qwen_split_kv_decode_matches_eager_attention(
         paged_logits = paged_runner(decode_input).logits
 
     torch.testing.assert_close(paged_logits, eager_logits, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("num_logical_blocks", "expected"),
+    [
+        (1, 1),
+        (8, 8),
+        (34, 16),
+        (64, 16),
+        (128, 32),
+        (256, 64),
+        (512, 64),
+        (1024, 64),
+    ],
+)
+def test_choose_num_splits_matches_measured_optima(
+    num_logical_blocks: int,
+    expected: int,
+) -> None:
+    """Pins the optima measured in benchmarks/micro-paged-decode-2026-08-23.md."""
+    assert choose_num_splits(num_logical_blocks, 64) == expected
+
+
+def test_choose_num_splits_respects_operator_precondition() -> None:
+    for num_logical_blocks in range(1, 400):
+        num_splits = choose_num_splits(num_logical_blocks, 64)
+        assert 1 <= num_splits <= num_logical_blocks
+        assert num_splits <= 64
+
+
+def test_choose_num_splits_honours_max_splits() -> None:
+    assert choose_num_splits(1024, 8) == 8
+    assert choose_num_splits(1024, 1) == 1

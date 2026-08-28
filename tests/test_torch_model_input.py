@@ -193,3 +193,30 @@ def test_query_start_loc_describes_each_packed_request_slice() -> None:
     )
     assert model_input.query_start_loc.numel() == len(batch.requests) + 1
     assert model_input.query_start_loc[-1].item() == model_input.input_token_ids.numel()
+
+
+def test_host_metadata_matches_device_tensors() -> None:
+    """Gate 6.1: the per-layer loop reads these instead of syncing on the device.
+
+    The refactor is only correct if the host copies carry exactly what the device
+    tensors carry, so pin that invariant here.
+    """
+    batch = ScheduledBatch(
+        step_id=0,
+        requests=(
+            make_request("a", (1, 2, 3), 0, (0, 1)),
+            make_request("b", (4,), 5, (2, 3, 4), work_type=WorkType.DECODE),
+            make_request("c", (6, 7), 2, (5, 6)),
+        ),
+    )
+
+    model_input = ModelInput.from_plan(batch, block_len=2, device=torch.device("cpu"))
+
+    assert model_input.query_start_loc_host == tuple(
+        model_input.query_start_loc.tolist()
+    )
+    assert model_input.context_lens_host == tuple(model_input.context_lens.tolist())
+    assert len(model_input.query_start_loc_host) == len(batch.requests) + 1
+    assert len(model_input.context_lens_host) == len(batch.requests)
+    assert all(type(value) is int for value in model_input.query_start_loc_host)
+    assert all(type(value) is int for value in model_input.context_lens_host)

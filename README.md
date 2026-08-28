@@ -127,12 +127,13 @@ python -m pytest
 ## Qwen2.5-0.5B end-to-end smoke test
 
 Install the optional model dependencies and point the smoke test at a local
-Hugging Face checkpoint:
+Hugging Face checkpoint. The scripts default to `$EINF_MODEL_DIR`, falling back
+to `~/models/Qwen2.5-0.5B`, so `--model-dir` is only needed to override it:
 
 ```bash
 python -m pip install -e '.[dev,qwen]'
+export EINF_MODEL_DIR=/path/to/Qwen2.5-0.5B
 python scripts/run_qwen.py \
-  --model-dir /home/wyg/python/models/Qwen2.5-0.5B \
   --max-prefill-chunk-len 4 \
   --flash-attention \
   --compare-hf

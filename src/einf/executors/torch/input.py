@@ -14,6 +14,14 @@ class ModelInput:
     query_start_loc: Tensor
     block_tables: Tensor
     context_lens: Tensor
+    # Host-side copies of the two metadata arrays that the per-layer attention
+    # loop needs as Python ints. They are built here from the plan's own lists,
+    # so producing them is free. Reading the device tensors instead forced a
+    # cudaStreamSynchronize three times per request per layer, which is 1152
+    # synchronisations per step at concurrency 16 (Gate 6.1). The device tensors
+    # stay because ops and index arithmetic still consume them.
+    query_start_loc_host: tuple[int, ...]
+    context_lens_host: tuple[int, ...]
 
     @classmethod
     def from_plan(cls, plan: BatchPlan, *, block_len: int, device: torch.device) -> "ModelInput":
@@ -56,6 +64,8 @@ class ModelInput:
             query_start_loc=torch.tensor(query_start_loc, device=device, dtype=torch.long),
             block_tables=torch.nn.utils.rnn.pad_sequence(block_tables, batch_first=True, padding_value=-1),
             context_lens=torch.tensor(context_lens, device=device, dtype=torch.long),
+            query_start_loc_host=tuple(query_start_loc),
+            context_lens_host=tuple(context_lens),
         )
 
     @classmethod

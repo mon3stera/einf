@@ -5,6 +5,7 @@ pub mod execution_plan;
 pub mod kv_cache;
 pub mod policy;
 pub mod request;
+pub mod rollback;
 pub mod sample;
 pub mod scheduler;
 

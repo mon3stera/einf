@@ -8,6 +8,7 @@ use crate::policy::{PolicyRequest, SchedulingPolicy};
 use crate::request::{
     AdvanceResult, CompletionReason, Request, RequestId, RequestSpec, RequestState,
 };
+use crate::rollback::RollbackScope;
 use crate::sample::SamplingPlan;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,51 +535,89 @@ impl<P: SchedulingPolicy> Scheduler<P> {
         }
 
         // Validate the complete result before mutating any request or cache state.
-        let mut staged_requests = self.requests.clone();
-        let mut staged_cache = self.cache.clone();
-        let mut staged_running = self.running.clone();
+        match RollbackScope::run(self, |scope, ctx| {
+            let mut cache_snapshotted = false;
+            for item in result.request_results {
+                let id = item.request_id.clone();
+                let request = ctx
+                    .requests
+                    .get(&id)
+                    .expect("validated request result");
 
-        for item in result.request_results {
-            let request = staged_requests
-                .get_mut(&item.request_id)
-                .expect("validated request result");
+                let reason = if item.is_eos {
+                    Some(CompletionReason::Eos)
+                } else if request.generated_token_ids().len() + item.generated_token_ids.len()
+                    == request.max_new_len()
+                {
+                    Some(CompletionReason::Length)
+                } else {
+                    None
+                };
 
-            let reason = if item.is_eos {
-                Some(CompletionReason::Eos)
-            } else if request.generated_token_ids().len() + item.generated_token_ids.len()
-                == request.max_new_len()
-            {
-                Some(CompletionReason::Length)
-            } else {
-                None
-            };
+                let old_cached_len = request.cached_len();
+                let old_sample_index = request.sample_index();
+                let old_state = request.state();
+                let old_reason = request.completion_reason();
+                let generated_extra = item.generated_token_ids.len();
+                let new_cached_len = old_cached_len
+                    .checked_add(item.cached_len_delta)
+                    .ok_or(ControlError::ArithmeticOverflow)?;
+                let block_len = ctx.cache.block_len();
+                let will_seal = new_cached_len / block_len > old_cached_len / block_len;
+                let will_release = reason.is_some();
 
-            let old_cached_len = request.cached_len();
+                let rollback_id = id.clone();
+                scope.defer(move |ctx| {
+                    ctx.requests
+                        .get_mut(&rollback_id)
+                        .expect("validated request result")
+                        .rollback_advance(
+                            generated_extra,
+                            old_sample_index,
+                            old_cached_len,
+                            old_state,
+                            old_reason,
+                        );
+                });
 
-            if let Err(error) = request.advance(AdvanceResult {
-                generated_token_ids: item.generated_token_ids,
-                cached_len_delta: item.cached_len_delta,
-                completion_reason: reason,
-            }) {
-                return self.reject_result(&plan, error);
-            }
+                ctx.requests
+                    .get_mut(&id)
+                    .expect("validated request result")
+                    .advance(AdvanceResult {
+                        generated_token_ids: item.generated_token_ids,
+                        cached_len_delta: item.cached_len_delta,
+                        completion_reason: reason,
+                    })?;
 
-            if let Err(error) = Self::seal_blocks(&mut staged_cache, request, old_cached_len) {
-                return self.reject_result(&plan, error);
-            }
+                if (will_seal || will_release) && !cache_snapshotted {
+                    let snapshot = ctx.cache.clone();
+                    scope.defer(move |ctx| ctx.cache = snapshot);
+                    cache_snapshotted = true;
+                }
 
-            if request.state().is_terminal() {
-                staged_running.retain(|candidate| candidate != &item.request_id);
-                if let Err(error) = staged_cache.release(item.request_id.clone()) {
-                    return self.reject_result(&plan, error);
+                let request = ctx.requests.get(&id).expect("validated request result");
+                Self::seal_blocks(&mut ctx.cache, request, old_cached_len)?;
+
+                if ctx
+                    .requests
+                    .get(&id)
+                    .expect("validated request result")
+                    .state()
+                    .is_terminal()
+                {
+                    if let Some(index) = ctx.running.iter().position(|candidate| candidate == &id) {
+                        let restored = id.clone();
+                        scope.defer(move |ctx| ctx.running.insert(index, restored));
+                        ctx.running.remove(index);
+                    }
+                    ctx.cache.release(id)?;
                 }
             }
+            Ok(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(error) => self.reject_result(&plan, error),
         }
-
-        self.requests = staged_requests;
-        self.cache = staged_cache;
-        self.running = staged_running;
-        Ok(())
     }
 
     pub fn fail_batch(
@@ -597,21 +636,33 @@ impl<P: SchedulingPolicy> Scheduler<P> {
                 actual: batch.step_id,
             });
         }
-        let mut staged_requests = self.requests.clone();
-        let mut staged_cache = self.cache.clone();
-        let mut staged_running = self.running.clone();
         let message = message.into();
-        for item in &plan.requests {
-            let request = staged_requests
-                .get_mut(&item.request_id)
-                .ok_or_else(|| ControlError::UnknownRequest(item.request_id.clone()))?;
-            request.fail(message.clone())?;
-            staged_running.retain(|candidate| candidate != &item.request_id);
-            staged_cache.release(item.request_id.clone())?;
-        }
-        self.requests = staged_requests;
-        self.cache = staged_cache;
-        self.running = staged_running;
-        Ok(())
+        RollbackScope::run(self, |scope, ctx| {
+            let snapshot = ctx.cache.clone();
+            scope.defer(move |ctx| ctx.cache = snapshot);
+            for item in &plan.requests {
+                let id = item.request_id.clone();
+                if ctx.requests.get(&id).is_none() {
+                    return Err(ControlError::UnknownRequest(id));
+                }
+                let rollback_id = id.clone();
+                scope.defer(move |ctx| {
+                    if let Some(request) = ctx.requests.get_mut(&rollback_id) {
+                        request.rollback_fail();
+                    }
+                });
+                ctx.requests
+                    .get_mut(&id)
+                    .expect("request existence checked above")
+                    .fail(message.clone())?;
+                if let Some(index) = ctx.running.iter().position(|candidate| candidate == &id) {
+                    let restored = id.clone();
+                    scope.defer(move |ctx| ctx.running.insert(index, restored));
+                    ctx.running.remove(index);
+                }
+                ctx.cache.release(id)?;
+            }
+            Ok(())
+        })
     }
 }

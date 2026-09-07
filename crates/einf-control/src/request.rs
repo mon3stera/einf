@@ -232,6 +232,27 @@ impl Request {
         self.assert_invariants()
     }
 
+    pub(crate) fn rollback_advance(
+        &mut self,
+        generated_extra: usize,
+        sample_index: u64,
+        cached_len: usize,
+        state: RequestState,
+        completion_reason: Option<CompletionReason>,
+    ) {
+        let keep = self.generated_token_ids.len().saturating_sub(generated_extra);
+        self.generated_token_ids.truncate(keep);
+        self.sample_index = sample_index;
+        self.cached_len = cached_len;
+        self.state = state;
+        self.completion_reason = completion_reason;
+    }
+
+    pub(crate) fn rollback_fail(&mut self) {
+        self.state = RequestState::Running;
+        self.error = None;
+    }
+
     pub fn finish(&mut self, reason: CompletionReason) -> Result<(), ControlError> {
         self.assert_invariants()?;
         self.assert_state(RequestState::Running)?;

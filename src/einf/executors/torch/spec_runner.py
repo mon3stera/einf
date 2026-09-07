@@ -150,27 +150,33 @@ class SpeculativeEngine:
             track.block_tables_dev = torch.arange(
                 len(track.block_table), dtype=torch.long, device=device
             ).unsqueeze(0)
-            # Host-pinned CSR staging: plan() takes indptr/last_page_len from
-            # pinned CPU (its H2D is sync-free) and the device arange as
-            # kv_indices — the identity page table makes it a true constant.
-            pages_cap = len(track.block_table)
-            pin = {"pin_memory": device.type == "cuda"}
-            qo = torch.zeros(2, dtype=torch.int32, **pin)
-            kv = torch.zeros(2, dtype=torch.int32, **pin)
-            lpl = torch.zeros(1, dtype=torch.int32, **pin)
-            track.csr = _CsrStaging(
-                qo_indptr=qo,
-                kv_indptr=kv,
-                last_page_len=lpl,
-                kv_indices_dev=torch.arange(
-                    pages_cap, dtype=torch.int32, device=device
-                ),
-                qo_np=qo.numpy(),
-                kv_np=kv.numpy(),
-                lpl_np=lpl.numpy(),
-            )
         # Fence guarding the pinned CSR staging against in-flight plan() H2D.
         self._csr_fence = torch.cuda.Event() if device.type == "cuda" else None
+
+    def _ensure_csr(self, track: _Track) -> _CsrStaging:
+        """Lazily build the track's pinned CSR staging (plan() reads indptr
+        and last_page_len from pinned CPU — its H2D is sync-free — and takes
+        kv_indices from a device arange that the identity page table renders
+        constant)."""
+        if track.csr is not None:
+            return track.csr
+        pages_cap = len(track.block_table)
+        pin = {"pin_memory": self._device.type == "cuda"}
+        qo = torch.zeros(2, dtype=torch.int32, **pin)
+        kv = torch.zeros(2, dtype=torch.int32, **pin)
+        lpl = torch.zeros(1, dtype=torch.int32, **pin)
+        track.csr = _CsrStaging(
+            qo_indptr=qo,
+            kv_indptr=kv,
+            last_page_len=lpl,
+            kv_indices_dev=torch.arange(
+                pages_cap, dtype=torch.int32, device=self._device
+            ),
+            qo_np=qo.numpy(),
+            kv_np=kv.numpy(),
+            lpl_np=lpl.numpy(),
+        )
+        return track.csr
 
     # ------------------------------------------------------------------
     # ModelInput construction (single request, from engine bookkeeping)
@@ -205,7 +211,7 @@ class SpeculativeEngine:
         # the context length and its last-page remainder. The fence first
         # drains any plan() H2D still reading this staging from the previous
         # forward (it almost never fires: plan's copies execute in microseconds).
-        csr = track.csr
+        csr = self._ensure_csr(track)
         if self._csr_fence is not None and not self._csr_fence.query():
             self._csr_fence.synchronize()
         pages = (end + self._block_len - 1) // self._block_len

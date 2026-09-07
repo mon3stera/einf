@@ -69,6 +69,7 @@ def _plain_greedy(
     """Sequential decode loop over the same weights (reference output)."""
     track = _Track(
         forward=runner.forward,
+        runner=runner,
         block_table=list(range(NUM_BLOCKS)),
         context_len=0,
         pending_token=-1,

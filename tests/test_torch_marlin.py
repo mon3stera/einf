@@ -28,8 +28,22 @@ requires_marlin = pytest.mark.skipif(
     reason="requires CUDA and the einf torch ops extension",
 )
 
+# Vendored Marlin targets SM80/86/89; on newer consumer parts (SM120) the
+# kernel loads but faults with cudaErrorIllegalInstruction, which poisons
+# the CUDA context for every later test in the process.
+_marlin_arch_supported = (
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability(0) <= (8, 9)
+)
+
+requires_marlin_arch = pytest.mark.skipif(
+    not _marlin_arch_supported,
+    reason="vendored Marlin supports SM80-SM89 only; perf baselines live on the RTX 4090",
+)
+
 
 @requires_marlin
+@requires_marlin_arch
 @pytest.mark.parametrize(("k", "n"), [(896, 1152), (4864, 896)])
 @pytest.mark.parametrize("m", [1, 16, 17, 64, 100])
 def test_marlin_gemm_matches_dequant_reference(k: int, n: int, m: int) -> None:
@@ -66,6 +80,7 @@ def test_marlin_gemm_matches_dequant_reference(k: int, n: int, m: int) -> None:
 
 
 @requires_marlin
+@requires_marlin_arch
 def test_marlin_gemm_rejects_undersized_workspace() -> None:
     device = torch.device("cuda")
     qweight, scales = pack_w4a16_marlin(
@@ -87,6 +102,7 @@ def test_marlin_gemm_rejects_undersized_workspace() -> None:
 
 
 @requires_marlin
+@requires_marlin_arch
 def test_marlin_linear_module_matches_fakequant() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda")
@@ -105,6 +121,7 @@ def test_marlin_linear_module_matches_fakequant() -> None:
 
 
 @requires_marlin
+@requires_marlin_arch
 def test_marlin_linear_forward_rejects_cpu() -> None:
     linear = torch.nn.Linear(128, 256, bias=True)
     quantized = MarlinW4A16Linear.from_linear(linear)

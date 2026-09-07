@@ -52,6 +52,32 @@ class _Track:
     context_len: int                    # tokens with live KV in this cache
     pending_token: int                  # committed token not yet in cache
     proposal_logits: list[torch.Tensor] = field(default_factory=list)
+    # Device-resident copy of the block table (constant for the engine's
+    # lifetime; the page assignment never changes) and per-query-length
+    # persistent input buffers, both created lazily on first use.
+    block_tables_dev: torch.Tensor | None = None
+    buffers: dict[int, _StepInputBuffers] = field(default_factory=dict)
+
+
+@dataclass
+class _StepInputBuffers:
+    """Persistent device buffers backing one track's ModelInputs for a fixed
+    packed-token count.
+
+    ModelInputs built on these are stream-ordered views: the next forward's
+    fill_/copy_ ops execute after the previous forward's kernels on the same
+    stream, so in-place reuse is safe — the same contract the ModelInputPool
+    documents. Constant fields (query_start_loc) are written once at
+    creation; per-step fields are single device-side scalar writes on the
+    q=1 hot path, with no allocation and no H2D.
+    """
+
+    token: torch.Tensor
+    position: torch.Tensor
+    slot: torch.Tensor
+    query_start_loc: torch.Tensor
+    context_lens: torch.Tensor
+    is_decode_only: bool
 
 
 class SpeculativeEngine:
@@ -90,6 +116,13 @@ class SpeculativeEngine:
             pending_token=-1,
         )
         self._stats = SpecStats()
+        # Device-resident block tables: the page assignment is fixed for the
+        # engine's lifetime, so the H2D happens once here instead of once
+        # per forward. Built with arange on the device — no host transfer.
+        for track in (self._target, self._draft):
+            track.block_tables_dev = torch.arange(
+                len(track.block_table), dtype=torch.long, device=device
+            ).unsqueeze(0)
 
     # ------------------------------------------------------------------
     # ModelInput construction (single request, from engine bookkeeping)
@@ -104,27 +137,58 @@ class SpeculativeEngine:
                 f"speculative cache capacity exceeded: need {needed_blocks} "
                 f"blocks, have {len(track.block_table)}"
             )
-        positions = list(range(start, start + n))
-        slots = [
-            track.block_table[pos // self._block_len] * self._block_len
-            + pos % self._block_len
-            for pos in positions
-        ]
+        buf = track.buffers.get(n)
+        if buf is None:
+            buf = _StepInputBuffers(
+                token=torch.empty(n, dtype=torch.long, device=self._device),
+                position=torch.empty(n, dtype=torch.long, device=self._device),
+                slot=torch.empty(n, dtype=torch.long, device=self._device),
+                # Constant per shape: [0, n] never changes for this buffer.
+                query_start_loc=torch.tensor(
+                    [0, n], dtype=torch.long, device=self._device
+                ),
+                context_lens=torch.empty(1, dtype=torch.long, device=self._device),
+                is_decode_only=n == 1,
+            )
+            track.buffers[n] = buf
+
+        end = start + n
+        buf.context_lens.fill_(end)
+        if n == 1:
+            # Hot path (the draft loop): four device-side scalar writes —
+            # no allocation, no H2D, no synchronization.
+            buf.token.fill_(q_token_ids[0])
+            buf.position.fill_(start)
+            buf.slot.fill_(
+                track.block_table[start // self._block_len] * self._block_len
+                + start % self._block_len
+            )
+        else:
+            # Verify shape (one call per step): positions come from a device
+            # arange; tokens and slots are one small H2D each.
+            buf.position.copy_(torch.arange(start, end, device=self._device))
+            buf.slot.copy_(
+                torch.tensor(
+                    [
+                        track.block_table[pos // self._block_len]
+                        * self._block_len
+                        + pos % self._block_len
+                        for pos in range(start, end)
+                    ],
+                    dtype=torch.long,
+                )
+            )
+            buf.token.copy_(torch.tensor(q_token_ids, dtype=torch.long))
         return ModelInput(
-            input_token_ids=torch.tensor(q_token_ids, device=self._device, dtype=torch.long),
-            position=torch.tensor(positions, device=self._device, dtype=torch.long),
-            slot_mapping=torch.tensor(slots, device=self._device, dtype=torch.long),
-            query_start_loc=torch.tensor([0, n], device=self._device, dtype=torch.long),
-            block_tables=torch.tensor(
-                [track.block_table], device=self._device, dtype=torch.long
-            ),
-            context_lens=torch.tensor([start + n], device=self._device, dtype=torch.long),
+            input_token_ids=buf.token,
+            position=buf.position,
+            slot_mapping=buf.slot,
+            query_start_loc=buf.query_start_loc,
+            block_tables=track.block_tables_dev,
+            context_lens=buf.context_lens,
             query_start_loc_host=(0, n),
-            context_lens_host=(start + n,),
-            # Single-token drafts are decode-shaped, and the draft track's
-            # block table never includes the graph's reserved dummy page, so
-            # the builder can assert replay eligibility from host state.
-            is_decode_only=n == 1,
+            context_lens_host=(end,),
+            is_decode_only=buf.is_decode_only,
         )
 
     # ------------------------------------------------------------------

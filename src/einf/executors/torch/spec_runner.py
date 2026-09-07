@@ -57,6 +57,30 @@ class _Track:
     # persistent input buffers, both created lazily on first use.
     block_tables_dev: torch.Tensor | None = None
     buffers: dict[int, _StepInputBuffers] = field(default_factory=dict)
+    csr: _CsrStaging | None = None
+
+
+@dataclass
+class _CsrStaging:
+    """Host-pinned FlashInfer CSR staging for one track.
+
+    plan() reads context lengths on the host to compute its launch schedule,
+    then copies indptr/last_page_len H2D from the pinned buffers — the same
+    layout the ModelInputPool proved out. The engine's identity page table
+    makes kv_indices a constant device arange written once at init. The
+    indptr/last_page_len staging is fenced: host writes for forward i+1 wait
+    on an event recorded after forward i, because plan()'s H2D of forward i
+    may still be in flight (the hazard the pool fences as
+    _wait_for_previous_copies).
+    """
+
+    qo_indptr: torch.Tensor             # pinned int32 [2]
+    kv_indptr: torch.Tensor             # pinned int32 [2]
+    last_page_len: torch.Tensor         # pinned int32 [1]
+    kv_indices_dev: torch.Tensor        # device int32 [pages capacity]
+    qo_np: object                       # numpy views of the pinned rows
+    kv_np: object
+    lpl_np: object
 
 
 @dataclass
@@ -123,6 +147,27 @@ class SpeculativeEngine:
             track.block_tables_dev = torch.arange(
                 len(track.block_table), dtype=torch.long, device=device
             ).unsqueeze(0)
+            # Host-pinned CSR staging: plan() takes indptr/last_page_len from
+            # pinned CPU (its H2D is sync-free) and the device arange as
+            # kv_indices — the identity page table makes it a true constant.
+            pages_cap = len(track.block_table)
+            pin = {"pin_memory": device.type == "cuda"}
+            qo = torch.zeros(2, dtype=torch.int32, **pin)
+            kv = torch.zeros(2, dtype=torch.int32, **pin)
+            lpl = torch.zeros(1, dtype=torch.int32, **pin)
+            track.csr = _CsrStaging(
+                qo_indptr=qo,
+                kv_indptr=kv,
+                last_page_len=lpl,
+                kv_indices_dev=torch.arange(
+                    pages_cap, dtype=torch.int32, device=device
+                ),
+                qo_np=qo.numpy(),
+                kv_np=kv.numpy(),
+                lpl_np=lpl.numpy(),
+            )
+        # Fence guarding the pinned CSR staging against in-flight plan() H2D.
+        self._csr_fence = torch.cuda.Event() if device.type == "cuda" else None
 
     # ------------------------------------------------------------------
     # ModelInput construction (single request, from engine bookkeeping)
@@ -153,6 +198,17 @@ class SpeculativeEngine:
             track.buffers[n] = buf
 
         end = start + n
+        # Pinned CSR for plan(): only two host scalars change per forward —
+        # the context length and its last-page remainder. The fence first
+        # drains any plan() H2D still reading this staging from the previous
+        # forward (it almost never fires: plan's copies execute in microseconds).
+        csr = track.csr
+        if self._csr_fence is not None and not self._csr_fence.query():
+            self._csr_fence.synchronize()
+        pages = (end + self._block_len - 1) // self._block_len
+        csr.qo_np[1] = n
+        csr.kv_np[1] = pages
+        csr.lpl_np[0] = end - (pages - 1) * self._block_len
         buf.context_lens.fill_(end)
         if n == 1:
             # Hot path (the draft loop): four device-side scalar writes —
@@ -189,7 +245,18 @@ class SpeculativeEngine:
             query_start_loc_host=(0, n),
             context_lens_host=(end,),
             is_decode_only=buf.is_decode_only,
+            flashinfer_csr=(
+                csr.qo_indptr,
+                csr.kv_indptr,
+                csr.kv_indices_dev[:pages],
+                csr.last_page_len,
+            ),
         )
+
+    def _fence_csr(self) -> None:
+        """Cap the stream after a forward so later CSR staging writes are safe."""
+        if self._csr_fence is not None:
+            self._csr_fence.record()
 
     # ------------------------------------------------------------------
     # phases
@@ -207,6 +274,7 @@ class SpeculativeEngine:
             raise ValueError("prompt must be non-empty")
 
         out = self._target.forward(self._make_input(self._target, list(prompt_ids)))
+        self._fence_csr()
         first = _pick(out.logits[-1], greedy=greedy, generator=generator)
 
         self._target.context_len = len(prompt_ids)
@@ -215,6 +283,7 @@ class SpeculativeEngine:
         # The draft primes its cache with the prompt too; its own argmax is
         # discarded because the committed sequence comes from the target.
         draft_out = self._draft.forward(self._make_input(self._draft, list(prompt_ids)))
+        self._fence_csr()
         del draft_out
         self._draft.context_len = len(prompt_ids)
         self._draft.pending_token = first
@@ -234,8 +303,11 @@ class SpeculativeEngine:
         if try_graph is not None:
             out = try_graph(model_input)
             if out is not None:
+                self._fence_csr()
                 return ModelOutput(logits=out.logits.clone())
-        return draft.forward(model_input)
+        out = draft.forward(model_input)
+        self._fence_csr()
+        return out
 
     def step(
         self,
@@ -266,6 +338,7 @@ class SpeculativeEngine:
         # Verify: [pending, d_0 .. d_{K-1}] -> K+1 slot distributions.
         verify_q = [self._target.pending_token, *proposals]
         out = self._target.forward(self._make_input(self._target, verify_q))
+        self._fence_csr()
         target_logits = out.logits[-(self._num_spec_tokens + 1):].unsqueeze(0)
 
         if greedy:

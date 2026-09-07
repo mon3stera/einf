@@ -92,7 +92,14 @@ class DecodeCudaGraph:
             return None
         self._fill(bucket, model_input, batch)
         self._csr_ready = False
-        return self._replay_bucket(bucket, batch)
+        host_csr = None
+        if model_input.flashinfer_csr is not None and batch == bucket:
+            # Builder-supplied host CSR: skip the device-side build and
+            # plan()'s synchronous D2H of device indptr. Only safe unpadded
+            # (batch == bucket), because the staging carries no pad rows.
+            _qo, indptr, indices, last_page = model_input.flashinfer_csr
+            host_csr = (indptr, indices, last_page)
+        return self._replay_bucket(bucket, batch, host_csr=host_csr)
 
     def try_replay_plan(self, plan: object) -> ModelOutput | None:
         packed = self.pack_plan(plan)
@@ -261,11 +268,12 @@ class DecodeCudaGraph:
             dst.slot_mapping[batch:] = self.dummy_slot
             dst.context_lens[batch:] = 1
 
-    def _replay_bucket(self, bucket: int, batch: int) -> ModelOutput | None:
+    def _replay_bucket(
+        self, bucket: int, batch: int, *, host_csr: tuple | None = None
+    ) -> ModelOutput | None:
         try:
             self._ensure_captured(bucket)
-            host_csr = None
-            if self._csr_ready:
+            if host_csr is None and self._csr_ready:
                 host_csr = (
                     self._host_kv_indptr[: bucket + 1],
                     self._host_kv_indices[: self._csr_nnz],

@@ -82,7 +82,10 @@ class SpeculativeEngine:
         )
         self._draft = _Track(
             forward=draft.forward,
-            block_table=list(range(num_blocks)),
+            # Reserve the last page: the runner-level decode graph captures
+            # with it as the dummy block, and try_replay refuses any block
+            # table that touches it. Harmless when the draft runs eager.
+            block_table=list(range(num_blocks - 1)),
             context_len=0,
             pending_token=-1,
         )
@@ -149,6 +152,23 @@ class SpeculativeEngine:
         self._draft.pending_token = first
         return first
 
+    def _draft_decode_forward(self, draft, token: int):
+        """One draft decode pass, preferring the runner's captured CUDA graph.
+
+        The draft loop is K+1 identical q=1 forwards — exactly the shape the
+        runner-level decode graph captures (embed through lm_head, batch
+        bucket 1). Graph outputs are views into the static replay buffer and
+        every replay overwrites them, so a graph hit must clone the logits
+        before the proposal loop stores them for the accept/reject step.
+        """
+        model_input = self._make_input(draft, [token])
+        try_graph = getattr(draft, "try_decode_cuda_graph", None)
+        if try_graph is not None:
+            out = try_graph(model_input)
+            if out is not None:
+                return ModelOutput(logits=out.logits.clone())
+        return draft.forward(model_input)
+
     def step(
         self,
         *,
@@ -167,7 +187,7 @@ class SpeculativeEngine:
         proposals: list[int] = []
         token = draft.pending_token
         for i in range(self._num_spec_tokens + 1):
-            out = draft.forward(self._make_input(draft, [token]))
+            out = self._draft_decode_forward(draft, token)
             draft.context_len += 1
             if i < self._num_spec_tokens:
                 logits = out.logits[-1]

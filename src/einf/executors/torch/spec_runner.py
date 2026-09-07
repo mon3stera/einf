@@ -48,6 +48,7 @@ class _Track:
     """Per-model speculative state."""
 
     forward: object                     # ModelInput -> ModelOutput
+    runner: object                      # the QwenModelRunner itself
     block_table: list[int]
     context_len: int                    # tokens with live KV in this cache
     pending_token: int                  # committed token not yet in cache
@@ -126,12 +127,14 @@ class SpeculativeEngine:
         # so physical block i is logical block i for both.
         self._target = _Track(
             forward=target.forward,
+            runner=target,
             block_table=list(range(num_blocks)),
             context_len=0,
             pending_token=-1,
         )
         self._draft = _Track(
             forward=draft.forward,
+            runner=draft,
             # Reserve the last page: the runner-level decode graph captures
             # with it as the dummy block, and try_replay refuses any block
             # table that touches it. Harmless when the draft runs eager.
@@ -299,7 +302,7 @@ class SpeculativeEngine:
         before the proposal loop stores them for the accept/reject step.
         """
         model_input = self._make_input(draft, [token])
-        try_graph = getattr(draft, "try_decode_cuda_graph", None)
+        try_graph = getattr(draft.runner, "try_decode_cuda_graph", None)
         if try_graph is not None:
             out = try_graph(model_input)
             if out is not None:

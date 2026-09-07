@@ -106,7 +106,7 @@ def build_runner(config, cache, *, args, dtype, device, model_dir):
     return runner
 
 
-def _run_scheduler_path(config, runner, *, args, prompt_ids, device) -> tuple[int, ...]:
+def _run_scheduler_path(config, runner, args, prompt_ids, *, device) -> tuple[int, ...]:
     """Plain (non-speculative) serving path through the Rust control plane."""
     scheduler = Scheduler(
         policy="fcfs",
@@ -137,6 +137,7 @@ def _run_scheduler_path(config, runner, *, args, prompt_ids, device) -> tuple[in
     if request.state is RequestState.FAILED:
         raise RuntimeError(request.error)
 
+    print("completion_reason:", request.completion_reason)
     return request.generated_token_ids
 
 
@@ -235,8 +236,6 @@ def main() -> None:
     print("prompt_ids:", list(prompt_ids))
     print("generated_ids:", generated_ids)
     print("generated_text:", repr(tokenizer.decode(generated_ids)))
-    if args.spec_tokens == 0:
-        print("completion_reason:", request.completion_reason)
 
     if args.compare_hf:
         index_path = model_dir / "model.safetensors.index.json"

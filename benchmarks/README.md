@@ -466,10 +466,47 @@ also rises. QwenAttention currently launches one Paged operator per Decode
 request per layer, so a packed batched Paged Decode operator is the next
 system-level throughput boundary.
 
+## Decode-only fixed batch
+
+`benchmark_decode_only.py` drains Prefill first, then holds the same
+`concurrency` running requests so every measured step is decode-only. Completed
+requests are not replaced. Use this for decode tokens/s; the closed-loop serving
+number includes mixed Prefill.
+
+```bash
+python benchmarks/benchmark_decode_only.py \
+  --decode-backend flashinfer \
+  --concurrency 8 \
+  --prompt-lens 512 \
+  --warmup-steps 80 \
+  --steps 200 \
+  --max-prefill-chunk-len 128 \
+  --max-batch-len 512
+
+# same-host vLLM A/B (isolated subprocesses; prefill/TTFT excluded)
+python benchmarks/benchmark_decode_only.py \
+  --engine both \
+  --decode-backend flashinfer \
+  --concurrency 8 \
+  --prompt-lens 512 \
+  --warmup-steps 80 \
+  --steps 200
+```
+
+vLLM decode throughput uses `first_token_ts → last_token_ts` from
+`RequestOutput.metrics`, so the first generated token (prefill) is not counted.
+Do not mix this with HTTP `bench serve` or `vllm_golden.md`.
+
 ## vLLM golden baseline
 
-The production-grade system target is recorded in
-[`vllm_golden.md`](vllm_golden.md). It uses an isolated vLLM 0.26.0 environment
+`vllm_golden.md` is the **previous** 4090 (now failed), vLLM 0.26.0. Do not
+compare current einf numbers to it. The current host's FlashInfer decode
+ladder and same-day vLLM 0.17.0 run are
+[`flashinfer-decode-opt-2026-08-29.md`](flashinfer-decode-opt-2026-08-29.md).
+Post-migration same-host numbers from 2026-08-23 (older session) remain in
+[`post-migration-2026-08-23.md`](post-migration-2026-08-23.md).
+
+The historical golden used an isolated vLLM 0.26.0 environment
 and a matched fixed workload of 512 Prompt tokens, 64 output tokens, greedy
 sampling, a 512-token batch budget, and concurrency 1/4/8/16.
 

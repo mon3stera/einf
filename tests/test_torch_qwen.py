@@ -86,6 +86,24 @@ def test_qwen_cached_decode_matches_full_recompute() -> None:
     torch.testing.assert_close(cached_decode, full_decode, rtol=1e-5, atol=1e-5)
 
 
+def test_qwen_chunked_prefill_matches_full_recompute() -> None:
+    torch.manual_seed(5)
+    config = make_config()
+    chunked_runner = QwenModelRunner(config, cache=make_cache(config)).eval()
+    full_runner = QwenModelRunner(config, cache=make_cache(config)).eval()
+    full_runner.load_state_dict(chunked_runner.state_dict())
+
+    chunked_runner(make_input((1, 2, 3, 4), start_position=0, block_table=(0, 1)))
+    chunked_logits = chunked_runner(
+        make_input((5, 6, 7), start_position=4, block_table=(0, 1, 2, 3))
+    ).logits
+    full_logits = full_runner(
+        make_input((1, 2, 3, 4, 5, 6, 7), start_position=0, block_table=(0, 1, 2, 3))
+    ).logits[-3:]
+
+    torch.testing.assert_close(chunked_logits, full_logits, rtol=1e-5, atol=1e-5)
+
+
 def test_qwen_mixed_packed_requests_match_separate_execution() -> None:
     torch.manual_seed(1)
     config = make_config()

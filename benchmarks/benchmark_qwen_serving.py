@@ -23,6 +23,10 @@ DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
+KV_DTYPES = {
+    **DTYPES,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
 
 
 @dataclass(slots=True)
@@ -83,16 +87,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measured-completions", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=KV_DTYPES,
+        default="auto",
+        help="KV cache storage dtype; auto follows --dtype. fp8_e4m3 requires "
+        "--decode-backend=flashinfer",
+    )
     parser.add_argument("--block-len", type=int, default=16)
     parser.add_argument("--num-blocks", type=int, default=0)
     parser.add_argument("--max-batch-len", type=int, default=512)
     parser.add_argument("--max-prefill-chunk-len", type=int, default=128)
     parser.add_argument(
         "--decode-backend",
-        choices=("eager", "paged"),
+        choices=("eager", "paged", "flashinfer"),
         default="paged",
     )
     parser.add_argument("--paged-decode-max-splits", type=int, default=64)
+    parser.add_argument("--w4a16", action="store_true")
     parser.add_argument("--progress-every", type=int, default=8)
     return parser.parse_args()
 
@@ -129,12 +141,16 @@ def main() -> None:
         )
 
     dtype = DTYPES[args.dtype]
+    kv_dtype = dtype if args.kv_cache_dtype == "auto" else KV_DTYPES[args.kv_cache_dtype]
+    if kv_dtype != dtype and args.decode_backend != "flashinfer":
+        raise SystemExit("--kv-cache-dtype=fp8_e4m3 requires --decode-backend=flashinfer")
     device = torch.device("cuda")
     load_start = time.perf_counter()
+    cache_blocks = num_blocks + int(args.decode_backend == "flashinfer")
     cache = TorchKVCacheStorage(
         KVCacheGeometry(
             num_layers=config.num_hidden_layers,
-            num_blocks=num_blocks,
+            num_blocks=cache_blocks,
             block_len=args.block_len,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
@@ -142,14 +158,30 @@ def main() -> None:
         dtype=dtype,
         device=device,
         use_custom_ops=True,
+        kv_dtype=kv_dtype,
     )
-    runner = QwenModelRunner(
-        config,
-        cache=cache,
-        use_paged_decode_attention=args.decode_backend == "paged",
-        paged_decode_max_splits=args.paged_decode_max_splits,
-    ).to(device=device, dtype=dtype).eval()
-    runner.load_checkpoint(model_dir / "model.safetensors")
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            runner = QwenModelRunner(
+                config,
+                cache=cache,
+                use_paged_decode_attention=args.decode_backend == "paged",
+                use_flashinfer_attention=args.decode_backend == "flashinfer",
+                paged_decode_max_splits=args.paged_decode_max_splits,
+                dtype=dtype,
+                w4a16=args.w4a16,
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    if args.w4a16:
+        # Quantized on CPU masters; the runner moves itself to the device
+        # inside load_checkpoint so the fp transient never reaches the GPU.
+        runner = runner.eval()
+    else:
+        runner = runner.to(device=device, dtype=dtype).eval()
+    runner.load_checkpoint(model_dir)
     torch.cuda.synchronize()
     load_seconds = time.perf_counter() - load_start
 
@@ -262,7 +294,10 @@ def main() -> None:
     print(f"device: {torch.cuda.get_device_name()}")
     print(f"torch: {torch.__version__}, cuda: {torch.version.cuda}, dtype: {dtype}")
     print(f"model: {model_dir}")
-    print(f"decode_backend: {args.decode_backend}, prefill_backend: eager")
+    prefill_backend = (
+        "flashinfer" if args.decode_backend == "flashinfer" else "sdpa"
+    )
+    print(f"decode_backend: {args.decode_backend}, prefill_backend: {prefill_backend}")
     print(
         f"concurrency={args.concurrency}, prompt_lens={prompt_lens}, "
         f"output_lens={output_lens}, chunk={args.max_prefill_chunk_len}, "

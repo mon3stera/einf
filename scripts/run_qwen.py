@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -21,6 +22,10 @@ DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
+KV_DTYPES = {
+    **DTYPES,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-len", type=int, default=8)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=KV_DTYPES,
+        default="auto",
+        help="KV cache storage dtype; auto follows --dtype. fp8_e4m3 halves "
+        "KV memory and read bandwidth and requires the flashinfer backend",
+    )
     parser.add_argument("--block-len", type=int, default=16)
     parser.add_argument("--num-blocks", type=int, default=256)
     parser.add_argument("--max-batch-len", type=int, default=128)
@@ -36,7 +48,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flash-attention", action="store_true")
     parser.add_argument("--paged-decode-attention", action="store_true")
     parser.add_argument("--paged-decode-max-splits", type=int, default=64)
+    parser.add_argument(
+        "--attn-backend",
+        choices=("einf", "flashinfer"),
+        default="einf",
+        help="einf keeps in-house kernels; flashinfer uses paged BatchPrefill",
+    )
     parser.add_argument("--compare-hf", action="store_true")
+    parser.add_argument("--w4a16", action="store_true")
     return parser.parse_args()
 
 
@@ -48,16 +67,20 @@ def main() -> None:
     model_dir = args.model_dir.expanduser().resolve()
     config = QwenConfig.from_json(model_dir / "config.json")
     dtype = DTYPES[args.dtype]
+    kv_dtype = dtype if args.kv_cache_dtype == "auto" else KV_DTYPES[args.kv_cache_dtype]
+    if kv_dtype != dtype and args.attn_backend != "flashinfer":
+        raise SystemExit("--kv-cache-dtype=fp8_e4m3 requires --attn-backend=flashinfer")
     device = torch.device("cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     prompt_ids = tuple(
         tokenizer(args.prompt, return_tensors="pt").input_ids[0].tolist()
     )
 
+    cache_blocks = args.num_blocks + int(args.attn_backend == "flashinfer")
     cache = TorchKVCacheStorage(
         KVCacheGeometry(
             num_layers=config.num_hidden_layers,
-            num_blocks=args.num_blocks,
+            num_blocks=cache_blocks,
             block_len=args.block_len,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
@@ -65,18 +88,43 @@ def main() -> None:
         dtype=dtype,
         device=device,
         use_custom_ops=True,
+        kv_dtype=kv_dtype,
     )
-    runner = QwenModelRunner(
-        config,
-        cache=cache,
-        use_flash_attention=args.flash_attention,
-        use_paged_decode_attention=args.paged_decode_attention,
-        paged_decode_max_splits=args.paged_decode_max_splits,
-    ).to(
-        device=device,
-        dtype=dtype,
-    ).eval()
-    runner.load_checkpoint(model_dir / "model.safetensors")
+    if args.attn_backend == "flashinfer" and (
+        args.flash_attention or args.paged_decode_attention
+    ):
+        raise SystemExit(
+            "--attn-backend=flashinfer cannot be combined with in-house attention flags"
+        )
+    # Large models must be constructed directly in the working dtype on the
+    # device: default fp32 CPU construction transiently needs ~4 bytes/param
+    # and OOM-kills a 7B model on this box (no swap).
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            runner = QwenModelRunner(
+                config,
+                cache=cache,
+                use_flash_attention=args.flash_attention,
+                use_paged_decode_attention=args.paged_decode_attention,
+                use_flashinfer_attention=args.attn_backend == "flashinfer",
+                paged_decode_max_splits=args.paged_decode_max_splits,
+                dtype=dtype,
+                w4a16=args.w4a16,
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    if args.w4a16:
+        # W4A16 masters stay on CPU through load_checkpoint; the runner moves
+        # only the quantized weights to the device after quantization.
+        runner = runner.eval()
+    else:
+        runner = runner.to(
+            device=device,
+            dtype=dtype,
+        ).eval()
+    runner.load_checkpoint(model_dir)
 
     scheduler = Scheduler(
         policy="fcfs",
@@ -114,13 +162,26 @@ def main() -> None:
     print("completion_reason:", request.completion_reason)
 
     if args.compare_hf:
+        index_path = model_dir / "model.safetensors.index.json"
+        total_size = 0
+        if index_path.is_file():
+            total_size = json.loads(index_path.read_text())["metadata"]["total_size"]
+        elif (model_dir / "model.safetensors").is_file():
+            total_size = (model_dir / "model.safetensors").stat().st_size
+
+        # The reference must coexist with the einf runner; when the weights
+        # cannot fit twice in VRAM, compare against a CPU reference.
+        vram_bytes = torch.cuda.get_device_properties(device).total_memory
+        ref_device = device if total_size * 2 < vram_bytes else torch.device("cpu")
+
         reference = AutoModelForCausalLM.from_pretrained(
             model_dir,
             dtype=dtype,
             attn_implementation="eager",
             local_files_only=True,
-        ).to(device).eval()
-        inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
+        ).to(ref_device).eval()
+        print(f"hf_reference_device: {ref_device}")
+        inputs = tokenizer(args.prompt, return_tensors="pt").to(ref_device)
         with torch.inference_mode():
             output_ids = reference.generate(
                 **inputs,

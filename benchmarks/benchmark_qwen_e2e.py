@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paged-decode-attention", action="store_true")
     parser.add_argument("--paged-decode-max-splits", type=int, default=64)
     parser.add_argument(
+        "--attn-backend",
+        choices=("einf", "flashinfer"),
+        default="einf",
+    )
+    parser.add_argument(
         "--respect-eos",
         action="store_true",
         help="stop at EOS instead of forcing exactly --max-new-len tokens",
@@ -199,11 +204,18 @@ def main() -> None:
         device=device,
         use_custom_ops=True,
     )
+    if args.attn_backend == "flashinfer" and (
+        args.flash_attention or args.paged_decode_attention
+    ):
+        raise SystemExit(
+            "--attn-backend=flashinfer cannot be combined with in-house attention flags"
+        )
     runner = QwenModelRunner(
         config,
         cache=cache,
         use_flash_attention=args.flash_attention,
         use_paged_decode_attention=args.paged_decode_attention,
+        use_flashinfer_attention=args.attn_backend == "flashinfer",
         paged_decode_max_splits=args.paged_decode_max_splits,
     ).to(device=device, dtype=dtype).eval()
     runner.load_checkpoint(model_dir / "model.safetensors")

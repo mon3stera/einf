@@ -6,7 +6,7 @@ temporarily wraps a small set of Python entry points for the duration of the run
 
 Phases
     sched             Scheduler.schedule()          Rust + PyO3 boundary
-    input_build       ModelInput.from_batch()       Python packing + H2D
+    input_build       pack_plan / pool.build       Python packing + H2D
       input_h2d       torch.tensor(...) within it   host->device copies
       input_cpu       input_build - input_h2d       pure Python packing
     forward           model_runner.forward()        model execution
@@ -50,7 +50,9 @@ import torch
 
 from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
 from einf.executors.torch import QwenConfig, QwenModelRunner, TorchExecutor
-from einf.executors.torch.input import ModelInput
+from einf.executors.torch.decode_graph import is_decode_only
+from einf.executors.torch.flashinfer_attn import FlashInferPagedAttention
+from einf.executors.torch.input import ModelInput, ModelInputPool
 from einf.executors.torch.sampler import Sampler
 from einf.request import RequestSpec, RequestState
 from einf.scheduler import Scheduler, WorkType
@@ -62,6 +64,10 @@ DEFAULT_MODEL_DIR = Path(
 DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
+}
+KV_DTYPES = {
+    **DTYPES,
+    "fp8_e4m3": torch.float8_e4m3fn,
 }
 
 ADDITIVE_PHASES = (
@@ -76,7 +82,7 @@ ADDITIVE_PHASES = (
     "apply_result",
     "step_residual",
 )
-BREAKDOWN_PHASES = ("input_h2d", "input_cpu")
+BREAKDOWN_PHASES = ("input_h2d", "input_cpu", "plan", "graph_replay")
 
 
 class Recorder:
@@ -120,18 +126,75 @@ def instrumented(recorder: Recorder, runner) -> None:
     """Install phase wrappers, and restore the originals on the way out."""
 
     original_from_batch = ModelInput.from_batch
+    original_pool_build = ModelInputPool.build
     original_sampler_sample = Sampler.sample
     original_torch_tensor = torch.tensor
     original_tensor_cpu = torch.Tensor.cpu
     original_runner_forward = runner.forward
+    original_try_replay = None
+    original_try_replay_plan = None
+    original_pack_plan = None
+    original_replay_bucket = None
+    original_plan = FlashInferPagedAttention.plan
+    original_plan_bucket = FlashInferPagedAttention.plan_decode_bucket
+    original_graph_replay = torch.cuda.CUDAGraph.replay
+    decode_graph = getattr(runner, "decode_graph", None)
+    if decode_graph is not None:
+        original_try_replay = decode_graph.try_replay
+        original_try_replay_plan = decode_graph.try_replay_plan
+        original_pack_plan = decode_graph.pack_plan
+        original_replay_bucket = decode_graph._replay_bucket
 
     def wrapped_from_batch(*args, **kwargs):
         with recorder.phase("input_build"):
             return original_from_batch(*args, **kwargs)
 
+    def wrapped_pool_build(self, *args, **kwargs):
+        with recorder.phase("input_build"):
+            return original_pool_build(self, *args, **kwargs)
+
     def wrapped_forward(*args, **kwargs):
         with recorder.phase("forward"):
             return original_runner_forward(*args, **kwargs)
+
+    def wrapped_try_replay(model_input):
+        if original_try_replay is None or not is_decode_only(model_input):
+            return None if original_try_replay is None else original_try_replay(model_input)
+        with recorder.phase("forward"):
+            return original_try_replay(model_input)
+
+    def wrapped_try_replay_plan(plan):
+        if original_pack_plan is None or original_replay_bucket is None:
+            return None if original_try_replay_plan is None else original_try_replay_plan(plan)
+        with recorder.phase("input_build"):
+            packed = original_pack_plan(plan)
+        if packed is None:
+            return None
+        bucket, batch = packed
+        with recorder.phase("forward"):
+            return original_replay_bucket(bucket, batch)
+
+    def wrapped_plan(self, *args, **kwargs):
+        start = time.perf_counter()
+        result = original_plan(self, *args, **kwargs)
+        recorder.add("plan", (time.perf_counter() - start) * 1000.0)
+        recorder.bump("plan_calls")
+        return result
+
+    def wrapped_plan_bucket(self, *args, **kwargs):
+        start = time.perf_counter()
+        result = original_plan_bucket(self, *args, **kwargs)
+        recorder.add("plan", (time.perf_counter() - start) * 1000.0)
+        recorder.bump("plan_calls")
+        return result
+
+    def wrapped_graph_replay(self, *args, **kwargs):
+        start = time.perf_counter()
+        result = original_graph_replay(self, *args, **kwargs)
+        if recorder.inside("forward"):
+            recorder.add("graph_replay", (time.perf_counter() - start) * 1000.0)
+            recorder.bump("graph_replay_calls")
+        return result
 
     def wrapped_sample(self, *args, **kwargs):
         with recorder.phase("sampler"):
@@ -163,17 +226,33 @@ def instrumented(recorder: Recorder, runner) -> None:
         return result
 
     ModelInput.from_batch = staticmethod(wrapped_from_batch)
+    ModelInputPool.build = wrapped_pool_build
     Sampler.sample = wrapped_sample
     torch.tensor = wrapped_torch_tensor
     torch.Tensor.cpu = wrapped_tensor_cpu
     runner.forward = wrapped_forward
+    torch.cuda.CUDAGraph.replay = wrapped_graph_replay
+    if decode_graph is not None and original_try_replay is not None:
+        decode_graph.try_replay = wrapped_try_replay
+    if decode_graph is not None and original_try_replay_plan is not None:
+        decode_graph.try_replay_plan = wrapped_try_replay_plan
+    FlashInferPagedAttention.plan = wrapped_plan
+    FlashInferPagedAttention.plan_decode_bucket = wrapped_plan_bucket
     try:
         yield
     finally:
         ModelInput.from_batch = original_from_batch
+        ModelInputPool.build = original_pool_build
         Sampler.sample = original_sampler_sample
         torch.tensor = original_torch_tensor
         torch.Tensor.cpu = original_tensor_cpu
+        torch.cuda.CUDAGraph.replay = original_graph_replay
+        FlashInferPagedAttention.plan = original_plan
+        FlashInferPagedAttention.plan_decode_bucket = original_plan_bucket
+        if decode_graph is not None and original_try_replay is not None:
+            decode_graph.try_replay = original_try_replay
+        if decode_graph is not None and original_try_replay_plan is not None:
+            decode_graph.try_replay_plan = original_try_replay_plan
         try:
             del runner.forward
         except AttributeError:
@@ -207,12 +286,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=KV_DTYPES,
+        default="auto",
+        help="KV cache storage dtype; auto follows --dtype. fp8_e4m3 requires "
+        "--decode-backend=flashinfer",
+    )
     parser.add_argument("--block-len", type=int, default=16)
     parser.add_argument("--num-blocks", type=int, default=0)
     parser.add_argument("--max-batch-len", type=int, default=512)
     parser.add_argument("--max-prefill-chunk-len", type=int, default=128)
-    parser.add_argument("--decode-backend", choices=("eager", "paged"), default="paged")
+    parser.add_argument(
+        "--decode-backend",
+        choices=("eager", "paged", "flashinfer"),
+        default="paged",
+    )
     parser.add_argument("--paged-decode-max-splits", type=int, default=64)
+    parser.add_argument("--w4a16", action="store_true")
     parser.add_argument("--timing", choices=("wall", "sync"), default="wall")
     parser.add_argument(
         "--profiler-steps",
@@ -245,11 +336,15 @@ def main() -> None:
     num_blocks = args.num_blocks or args.concurrency * blocks_per_request + args.concurrency
 
     dtype = DTYPES[args.dtype]
+    kv_dtype = dtype if args.kv_cache_dtype == "auto" else KV_DTYPES[args.kv_cache_dtype]
+    if kv_dtype != dtype and args.decode_backend != "flashinfer":
+        raise SystemExit("--kv-cache-dtype=fp8_e4m3 requires --decode-backend=flashinfer")
     device = torch.device("cuda")
+    cache_blocks = num_blocks + int(args.decode_backend == "flashinfer")
     cache = TorchKVCacheStorage(
         KVCacheGeometry(
             num_layers=config.num_hidden_layers,
-            num_blocks=num_blocks,
+            num_blocks=cache_blocks,
             block_len=args.block_len,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
@@ -257,18 +352,32 @@ def main() -> None:
         dtype=dtype,
         device=device,
         use_custom_ops=True,
+        kv_dtype=kv_dtype,
     )
-    runner = (
-        QwenModelRunner(
-            config,
-            cache=cache,
-            use_paged_decode_attention=args.decode_backend == "paged",
-            paged_decode_max_splits=args.paged_decode_max_splits,
-        )
-        .to(device=device, dtype=dtype)
-        .eval()
-    )
-    runner.load_checkpoint(model_dir / "model.safetensors")
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            runner = (
+                QwenModelRunner(
+                    config,
+                    cache=cache,
+                    use_paged_decode_attention=args.decode_backend == "paged",
+                    use_flashinfer_attention=args.decode_backend == "flashinfer",
+                    paged_decode_max_splits=args.paged_decode_max_splits,
+                    dtype=dtype,
+                    w4a16=args.w4a16,
+                )
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    if args.w4a16:
+        # Quantized on CPU masters; the runner moves itself to the device
+        # inside load_checkpoint so the fp transient never reaches the GPU.
+        runner = runner.eval()
+    else:
+        runner = runner.to(device=device, dtype=dtype).eval()
+    runner.load_checkpoint(model_dir)
     torch.cuda.synchronize()
 
     scheduler = Scheduler(

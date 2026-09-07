@@ -121,6 +121,10 @@ class SpeculativeEngine:
             context_lens=torch.tensor([start + n], device=self._device, dtype=torch.long),
             query_start_loc_host=(0, n),
             context_lens_host=(start + n,),
+            # Single-token drafts are decode-shaped, and the draft track's
+            # block table never includes the graph's reserved dummy page, so
+            # the builder can assert replay eligibility from host state.
+            is_decode_only=n == 1,
         )
 
     # ------------------------------------------------------------------

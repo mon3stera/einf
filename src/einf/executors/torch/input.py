@@ -6,6 +6,16 @@ import torch
 from torch import Tensor
 
 
+def is_decode_only_plan(plan: object) -> bool:
+    """Host-side decode-graph eligibility check over the plan's Python lists.
+
+    Lives here rather than in ``decode_graph`` so the pool can stamp the
+    verdict into the ModelInput it builds without a circular import.
+    """
+    requests = getattr(plan, "requests", ())
+    return bool(requests) and all(len(request.input_token_ids) == 1 for request in requests)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelInput:
     input_token_ids: Tensor
@@ -29,6 +39,14 @@ class ModelInput:
     # buffer to avoid plan()'s synchronous H2D for CPU page lists. ``None``
     # makes plan() fall back to the device-side ``build_paged_kv_csr``.
     flashinfer_csr: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
+    # Builder-asserted decode-graph eligibility: every query is a single
+    # token AND no block table touches the graph's dummy page. ``try_replay``
+    # trusts this instead of re-deriving it from device tensors, which would
+    # force a cudaStreamSynchronize per check per forward — the same pattern
+    # Gate 6.1 removed from the scheduler path via ``is_decode_only_plan``.
+    # Only builders that construct inputs from host-side state (the pool and
+    # the speculative engine) may set it.
+    is_decode_only: bool = False
 
     @classmethod
     def from_plan(cls, plan: BatchPlan, *, block_len: int, device: torch.device) -> "ModelInput":
@@ -184,6 +202,7 @@ class ModelInputPool:
                 self._d_kv_indices[:nnz],
                 self._host_last_page[:batch],
             ),
+            is_decode_only=is_decode_only_plan(plan),
         )
 
     def _wait_for_previous_copies(self) -> None:

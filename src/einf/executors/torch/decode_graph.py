@@ -5,7 +5,7 @@ import bisect
 import torch
 from torch import Tensor
 
-from einf.executors.torch.input import ModelInput
+from einf.executors.torch.input import ModelInput, is_decode_only_plan
 from einf.executors.torch.output import ModelOutput
 
 
@@ -38,19 +38,6 @@ def select_decode_graph_bucket(batch: int) -> int | None:
     if batch <= 0 or batch > MAX_DECODE_GRAPH_BATCH:
         return None
     return DECODE_GRAPH_BUCKETS[bisect.bisect_left(DECODE_GRAPH_BUCKETS, batch)]
-
-
-def is_decode_only(model_input: ModelInput) -> bool:
-    query_start = model_input.query_start_loc
-    if query_start.numel() < 2:
-        return False
-    q_lens = query_start[1:] - query_start[:-1]
-    return bool(torch.equal(q_lens, torch.ones_like(q_lens)))
-
-
-def is_decode_only_plan(plan: object) -> bool:
-    requests = getattr(plan, "requests", ())
-    return bool(requests) and all(len(request.input_token_ids) == 1 for request in requests)
 
 
 class DecodeCudaGraph:
@@ -92,13 +79,16 @@ class DecodeCudaGraph:
         self._csr_nnz = 0
 
     def try_replay(self, model_input: ModelInput) -> ModelOutput | None:
-        batch = int(model_input.context_lens.numel())
-        if not is_decode_only(model_input):
+        # Trust the builder's is_decode_only assertion instead of re-deriving
+        # eligibility from device tensors: a torch.equal / torch.any check on
+        # a device tensor forces a cudaStreamSynchronize, and the speculative
+        # engine replays five times per step. Builders stamp the flag from
+        # host-side state, so the checks cost nothing.
+        if not model_input.is_decode_only:
             return None
+        batch = int(model_input.context_lens.numel())
         bucket = select_decode_graph_bucket(batch)
         if bucket is None or bucket in self._failed:
-            return None
-        if torch.any(model_input.block_tables == self.dummy_block):
             return None
         self._fill(bucket, model_input, batch)
         self._csr_ready = False

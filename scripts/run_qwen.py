@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+import time
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -180,7 +182,9 @@ def main() -> None:
         raise SystemExit(
             "--attn-backend=flashinfer cannot be combined with in-house attention flags"
         )
+    t0 = time.monotonic()
     runner = build_runner(config, cache, args=args, dtype=dtype, device=device, model_dir=model_dir)
+    t_load = time.monotonic() - t0
 
     if args.spec_tokens > 0:
         from einf.executors.torch.spec_runner import SpeculativeEngine
@@ -222,6 +226,7 @@ def main() -> None:
             num_blocks=cache_blocks,
             num_spec_tokens=args.spec_tokens,
         )
+        t1 = time.monotonic()
         with torch.inference_mode():
             generated_ids, stats = engine.generate(
                 list(prompt_ids),
@@ -229,15 +234,22 @@ def main() -> None:
                 eos_token_id=config.eos_token_id,
                 greedy=True,
             )
+        t_gen = time.monotonic() - t1
         print(
             "spec_stats:",
             f"steps={stats.steps} proposed={stats.proposed} "
-            f"accepted={stats.accepted} rate={stats.accept_rate:.3f}",
+            f"accepted={stats.accepted} rate={stats.accept_rate:.3f} "
+            f"load_s={t_load:.1f} gen_s={t_gen:.2f} "
+            f"tokens_per_gen_s={len(generated_ids) / t_gen:.2f}",
         )
     else:
+        t1 = time.monotonic()
         generated_ids = _run_scheduler_path(
             config, runner, args, prompt_ids, device=device
         )
+        t_gen = time.monotonic() - t1
+        print(f"load_s={t_load:.1f} gen_s={t_gen:.2f} "
+              f"tokens_per_gen_s={len(generated_ids) / t_gen:.2f}")
 
     print("prompt_ids:", list(prompt_ids))
     print("generated_ids:", generated_ids)

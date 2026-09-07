@@ -143,21 +143,19 @@ class SpeculativeEngine:
             pending_token=-1,
         )
         self._stats = SpecStats()
-        # Device-resident block tables: the page assignment is fixed for the
-        # engine's lifetime, so the H2D happens once here instead of once
-        # per forward. Built with arange on the device — no host transfer.
-        for track in (self._target, self._draft):
-            track.block_tables_dev = torch.arange(
-                len(track.block_table), dtype=torch.long, device=device
-            ).unsqueeze(0)
         # Fence guarding the pinned CSR staging against in-flight plan() H2D.
         self._csr_fence = torch.cuda.Event() if device.type == "cuda" else None
 
-    def _ensure_csr(self, track: _Track) -> _CsrStaging:
-        """Lazily build the track's pinned CSR staging (plan() reads indptr
-        and last_page_len from pinned CPU — its H2D is sync-free — and takes
-        kv_indices from a device arange that the identity page table renders
-        constant)."""
+    def _ensure_track_constants(self, track: _Track) -> _CsrStaging:
+        """Lazily build the track's device-resident constants: the block
+        table (arange on the device — the page assignment is fixed for the
+        engine's lifetime, so no H2D ever) and the pinned CSR staging
+        (plan() reads indptr/last_page_len from pinned CPU — its H2D is
+        sync-free — and takes kv_indices from that same arange)."""
+        if track.block_tables_dev is None:
+            track.block_tables_dev = torch.arange(
+                len(track.block_table), dtype=torch.long, device=self._device
+            ).unsqueeze(0)
         if track.csr is not None:
             return track.csr
         pages_cap = len(track.block_table)
@@ -211,7 +209,7 @@ class SpeculativeEngine:
         # the context length and its last-page remainder. The fence first
         # drains any plan() H2D still reading this staging from the previous
         # forward (it almost never fires: plan's copies execute in microseconds).
-        csr = self._ensure_csr(track)
+        csr = self._ensure_track_constants(track)
         if self._csr_fence is not None and not self._csr_fence.query():
             self._csr_fence.synchronize()
         pages = (end + self._block_len - 1) // self._block_len

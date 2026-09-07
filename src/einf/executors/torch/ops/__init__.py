@@ -6,10 +6,31 @@ from einf.executors.torch.ops.loader import (
 )
 
 
-def write_slots_(K_cache, V_cache, slot_mapping, K, V) -> None:
-    """Load the extension and invoke the in-place KV-cache write operator."""
+def write_slots_(
+    K_cache,
+    V_cache,
+    slot_mapping,
+    K,
+    V,
+    *,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> None:
+    """Load the extension and invoke the in-place KV-cache write operator.
+
+    ``k_scale``/``v_scale`` multiply the values before they are quantized into
+    an FP8 cache; they are no-ops for a floating-point cache.
+    """
     load_custom_ops()
-    torch.ops.einf.write_slots_(K_cache, V_cache, slot_mapping, K, V)
+    torch.ops.einf.write_slots_(
+        K_cache,
+        V_cache,
+        slot_mapping,
+        K,
+        V,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
 
 
 def gather_context(K_cache, V_cache, block_table, context_len: int):
@@ -20,6 +41,20 @@ def gather_context(K_cache, V_cache, block_table, context_len: int):
         V_cache,
         block_table,
         context_len,
+    )
+
+
+def marlin_gemm(A, b_qweight, scales, out, workspace, *, group_size: int, max_par: int = 8) -> None:
+    """Load the extension and run the vendored Marlin W4A16 GEMM into ``out``."""
+    load_custom_ops()
+    torch.ops.einf.marlin_gemm(
+        A,
+        b_qweight,
+        scales,
+        out,
+        workspace,
+        group_size=group_size,
+        max_par=max_par,
     )
 
 
@@ -174,6 +209,7 @@ __all__ = [
     "flash_attention",
     "gather_context",
     "load_custom_ops",
+    "marlin_gemm",
     "paged_decode_attention_batched",
     "paged_decode_attention",
     "paged_decode_attention_split_kv",

@@ -25,6 +25,7 @@ _REQUIRED_OPS = (
     "paged_decode_attention",
     "paged_decode_attention_split_kv",
     "paged_decode_attention_batched",
+    "marlin_gemm",
 )
 
 
@@ -76,6 +77,9 @@ def load_custom_ops(*, verbose: bool = False) -> None:
             str(csrc / "gather_context_cuda.cu"),
             str(csrc / "contiguous_attention.cpp"),
             str(csrc / "contiguous_attention_cuda.cu"),
+            str(csrc / "marlin" / "marlin_cuda_kernel.cu"),
+            str(csrc / "marlin_gemm.cpp"),
+            str(csrc / "marlin_gemm_cuda.cu"),
             str(csrc / "cute_copy.cpp"),
             str(csrc / "cute_copy_cuda.cu"),
             str(csrc / "cute_elementwise_add.cpp"),

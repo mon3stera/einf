@@ -14,6 +14,19 @@ class KVCacheGeometry:
 
 
 class TorchKVCacheStorage:
+    """Paged K/V cache with an optional FP8 (E4M3-FN) storage dtype.
+
+    ``dtype`` is the working dtype of the attention inputs; ``kv_dtype`` is the
+    on-device storage dtype of the cache and may be ``torch.float8_e4m3fn`` to
+    halve KV memory and read bandwidth. FP8 storage is quantized on write by
+    ``write_slots`` (post-RoPE values, satfinite) and is only consumable by the
+    FlashInfer attention backend, which converts FP8 tiles back to the query
+    dtype inside its kernels. ``k_scale``/``v_scale`` are per-tensor write-side
+    scales; the default 1.0 matches vLLM's default FP8 KV configuration.
+    """
+
+    _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
     def __init__(
         self,
         geometry: KVCacheGeometry,
@@ -21,8 +34,21 @@ class TorchKVCacheStorage:
         dtype: torch.dtype,
         device,
         use_custom_ops: bool | None = None,
+        kv_dtype: torch.dtype | None = None,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
     ) -> None:
         self.geometry = geometry
+        self.kv_dtype = dtype if kv_dtype is None else kv_dtype
+        if self.kv_dtype not in self._FLOAT_DTYPES + (torch.float8_e4m3fn,):
+            raise ValueError(f"unsupported KV cache dtype: {self.kv_dtype}")
+        if self.kv_dtype == torch.float8_e4m3fn and (k_scale != 1.0 or v_scale != 1.0):
+            raise ValueError(
+                "FP8 KV cache scale dequantization is not wired through the "
+                "FlashInfer plan API yet; use unit scale"
+            )
+        self.k_scale = k_scale
+        self.v_scale = v_scale
         self.K = torch.empty(
             (
                 geometry.num_layers,
@@ -31,10 +57,10 @@ class TorchKVCacheStorage:
                 geometry.num_kv_heads,
                 geometry.head_dim,
             ),
-            dtype=dtype,
+            dtype=self.kv_dtype,
             device=device,
         )
-        self.V = torch.empty_like(self.K, dtype=dtype, device=device)
+        self.V = torch.empty_like(self.K, dtype=self.kv_dtype, device=device)
         if use_custom_ops is None:
             use_custom_ops = self.K.is_cuda
         if use_custom_ops and not self.K.is_cuda:
@@ -74,11 +100,23 @@ class TorchKVCacheStorage:
                 slot_mapping,
                 K,
                 V,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
             )
             return
 
+        if K.dtype != self.kv_dtype:
+            K = K.to(self.kv_dtype)
+            V = V.to(self.kv_dtype)
         K_slots = self._layer_slots(self.K, layer_idx)
         V_slots = self._layer_slots(self.V, layer_idx)
+        if self.kv_dtype not in self._FLOAT_DTYPES:
+            # torch's CPU scatter ops have no FP8 kernels; the byte view is
+            # bit-identical because FP8 storage is one byte wide.
+            K_slots = K_slots.view(torch.uint8)
+            V_slots = V_slots.view(torch.uint8)
+            K = K.view(torch.uint8)
+            V = V.view(torch.uint8)
         K_slots.index_copy_(0, slot_mapping, K)
         V_slots.index_copy_(0, slot_mapping, V)
 
@@ -87,6 +125,7 @@ class TorchKVCacheStorage:
         layer_idx: int,
         slot_mapping: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        self._assert_readable()
         K_slots = self._layer_slots(self.K, layer_idx)
         V_slots = self._layer_slots(self.V, layer_idx)
         return (
@@ -94,12 +133,21 @@ class TorchKVCacheStorage:
             V_slots.index_select(0, slot_mapping),
         )
 
+    def _assert_readable(self) -> None:
+        """FP8 bytes must be dequantized by the attention kernel that reads them."""
+        if self.kv_dtype not in self._FLOAT_DTYPES:
+            raise NotImplementedError(
+                "reading an FP8 KV cache is only supported through the "
+                "FlashInfer attention backend"
+            )
+
     def gather_context(
         self,
         layer_idx: int,
         block_tables: Tensor | tuple[int, ...],
         context_len: int,
     ) -> tuple[Tensor, Tensor]:
+        self._assert_readable()
         block_table = torch.as_tensor(
             block_tables,
             device=self.K.device,

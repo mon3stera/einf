@@ -14,11 +14,16 @@ einf::write_slots_(
     slot_mapping,  # [num_tokens], int64
     K,             # [num_tokens, num_kv_heads, head_dim]
     V,             # [num_tokens, num_kv_heads, head_dim]
+    k_scale=1.0,   # per-tensor write scale, applied before quantization
+    v_scale=1.0,
 ) -> None
 ```
 
 `K_cache` and `V_cache` are mutated in place. Python selects the layer before
 calling the operator, so the native code only owns physical-slot addressing.
+When the cache dtype is `float8_e4m3fn`, the inputs may be BF16/FP16/FP32 and
+are quantized to E4M3-FN with satfinite clamping; a floating-point cache still
+requires inputs of its own dtype.
 
 ```text
 einf::gather_context(

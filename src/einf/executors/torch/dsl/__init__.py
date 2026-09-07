@@ -23,6 +23,11 @@ __all__ = [
     "cute_online_softmax_layout",
     "cute_flash_attention_single_tile",
     "cute_flash_attention",
+    "compute_w4a16_scales",
+    "pack_w4a16_marlin",
+    "unpack_w4a16_marlin",
+    "fakequant_w4a16",
+    "cute_w4a16_gemm",
 ]
 
 
@@ -57,4 +62,17 @@ def __getattr__(name: str) -> Any:
         from einf.executors.torch.dsl.flash_attention import cute_flash_attention
 
         return cute_flash_attention
+    if name in {
+        "compute_w4a16_scales",
+        "pack_w4a16_marlin",
+        "unpack_w4a16_marlin",
+        "fakequant_w4a16",
+    }:
+        from einf.executors.torch.dsl import w4a16_pack
+
+        return getattr(w4a16_pack, name)
+    if name == "cute_w4a16_gemm":
+        from einf.executors.torch.dsl.w4a16_gemm import cute_w4a16_gemm
+
+        return cute_w4a16_gemm
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

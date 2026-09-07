@@ -141,7 +141,7 @@ def copy_thr_layout(num_warps: cutlass.Constexpr[int]):
     elif cutlass.const_expr(num_warps == 4):
         return cute.make_layout((16, 8), stride=(8, 1))
     else:
-        return cute.make_layout((16, 16), stride=(16, 1))
+        return cute.make_layout((32, 8), stride=(32, 1))
 
 @cute.jit
 def tiled_copy(num_warps: cutlass.Constexpr[int]):

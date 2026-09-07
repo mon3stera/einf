@@ -59,9 +59,31 @@ def accept_reject_greedy(
 
     Returns (accepted_tokens [B, K+1] int64, -1 padded; accepted_len [B]).
     """
-    raise NotImplementedError(
-        "练习：实现 greedy accept/reject（对照 accept_reject_greedy_reference 与测试）"
-    )
+
+    B, T = draft_tokens.shape
+
+    device = draft_tokens.device
+
+    # [B, T]
+    tids = torch.argmax(target_logits, dim=-1)
+
+    # [B, T + 1]
+    is_accept = draft_tokens == tids[:, :T]
+
+    # [B]
+    num_accepted = torch.cumprod(is_accept, dim=1).sum(dim=1)
+
+    # [B, T + 1]
+    out = torch.zeros((B, T + 1), dtype=torch.int64, device=device)
+    out.fill_(-1)
+
+    accept_len = num_accepted + 1
+
+    mask = torch.arange(T + 1, device=device).unsqueeze(0) < accept_len.unsqueeze(1)
+
+    out[mask] = tids[mask]
+
+    return out, accept_len
 
 
 def accept_reject_sampling(
@@ -90,9 +112,47 @@ def accept_reject_sampling(
 
     Returns (accepted_tokens [B, K+1] int64, -1 padded; accepted_len [B]).
     """
-    raise NotImplementedError(
-        "练习：实现 rejection sampling（对照 accept_reject_sampling_reference 与测试）"
-    )
+
+    B, K = draft_tokens.shape
+    V = target_logits.shape[-1]
+    device = draft_tokens.device
+
+    target_probs = torch.softmax(target_logits, dim=-1)  # [B, K + 1, V]
+    p = target_probs[:, :K, :]                          # [B, K, V]
+    p_bonus = target_probs[:, K:K+1, :]                 # [B, 1, V]
+    d = draft_probs                                     # [B, K, V]
+
+    draft_tokens_exp = draft_tokens.unsqueeze(-1)       # [B, K, 1]
+    p_x = torch.gather(p, dim=-1, index=draft_tokens_exp).squeeze(-1)  # [B, K]
+    d_x = torch.gather(d, dim=-1, index=draft_tokens_exp).squeeze(-1)  # [B, K]
+
+    u = torch.rand((B, K), device=device, dtype=p_x.dtype, generator=generator)
+    is_accept = u < torch.clamp(p_x / d_x, max=1.0)     # [B, K]
+
+    num_accepted = is_accept.long().cumprod(dim=1).sum(dim=1)  # [B]
+    accepted_len = num_accepted + 1                            # [B]
+
+    res = torch.clamp(p - d, min=0.0)                          # [B, K, V]
+    res_sum = res.sum(dim=-1, keepdim=True)                    # [B, K, 1]
+    res_dist = torch.where(res_sum > 0, res / torch.clamp(res_sum, min=1e-12), p)
+
+    candidate_dists = torch.cat([res_dist, p_bonus], dim=1)    # [B, K + 1, V]
+
+    gather_idx = num_accepted.view(B, 1, 1).expand(-1, 1, V)   # [B, 1, V]
+    selected_dist = torch.gather(candidate_dists, dim=1, index=gather_idx).squeeze(1) # [B, V]
+
+    next_token = torch.multinomial(selected_dist, num_samples=1, generator=generator).squeeze(-1) # [B]
+
+    out = torch.full((B, K + 1), -1, dtype=torch.int64, device=device)
+
+    positions = torch.arange(K, device=device).unsqueeze(0)    # [1, K]
+    mask_draft = positions < num_accepted.unsqueeze(1)         # [B, K]
+    out[:, :K] = torch.where(mask_draft, draft_tokens, out[:, :K])
+
+    out.scatter_(dim=1, index=num_accepted.unsqueeze(1), src=next_token.unsqueeze(1))
+
+    return out, accepted_len
+    
 
 
 def accept_reject_greedy_reference(

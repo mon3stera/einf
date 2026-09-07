@@ -72,8 +72,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_runner(config, cache, *, args, dtype, device, model_dir):
+def build_runner(config, cache, *, args, dtype, device, model_dir, w4a16=None):
     """Construct, load, and eval a Qwen runner (shared by target and draft)."""
+    if w4a16 is None:
+        w4a16 = args.w4a16
     # Large models must be constructed directly in the working dtype on the
     # device: default fp32 CPU construction transiently needs ~4 bytes/param
     # and OOM-kills a 7B model on this box (no swap).
@@ -89,11 +91,11 @@ def build_runner(config, cache, *, args, dtype, device, model_dir):
                 use_flashinfer_attention=args.attn_backend == "flashinfer",
                 paged_decode_max_splits=args.paged_decode_max_splits,
                 dtype=dtype,
-                w4a16=args.w4a16,
+                w4a16=w4a16,
             )
     finally:
         torch.set_default_dtype(previous_dtype)
-    if args.w4a16:
+    if w4a16:
         # W4A16 masters stay on CPU through load_checkpoint; the runner moves
         # only the quantized weights to the device after quantization.
         runner = runner.eval()
@@ -207,6 +209,10 @@ def main() -> None:
             dtype=dtype,
             device=device,
             model_dir=draft_dir,
+            # The draft stays in the native dtype: quantizing it only hurts
+            # proposal quality and adds load-time quantization for a model
+            # that is small anyway.
+            w4a16=False,
         )
         engine = SpeculativeEngine(
             runner,

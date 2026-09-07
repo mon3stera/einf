@@ -141,3 +141,39 @@ def test_torch_executor_runs_reference_model_runner() -> None:
     assert request_result.is_eos is (
         token_id == config.eos_token_id
     )
+
+
+def test_torch_executor_packs_random_sampling_params() -> None:
+    batch = ScheduledBatch(
+        step_id=14,
+        requests=(
+            ScheduledRequest(
+                request_id="rand",
+                input_token_ids=(5,),
+                start_position=0,
+                block_table=(0,),
+                work_type=WorkType.DECODE,
+                need_sample=True,
+                sampling_plan=SamplingPlan(
+                    SamplingParams(0.75, top_k=4, seed=7),
+                    3,
+                ),
+            ),
+        ),
+    )
+    executor = TorchExecutor(
+        model_runner=DeterministicModelRunner(vocab_size=16),
+        block_len=2,
+        eos_token_id=10,
+        device=torch.device("cpu"),
+    )
+    first = executor.execute(batch)
+    second = executor.execute(batch)
+    assert first.request_results[0].generated_token_ids == (
+        second.request_results[0].generated_token_ids
+    )
+    assert executor._host_f32[0, 0].item() == 0.75
+    assert executor._host_f32[0, 1].item() == 1.0
+    assert executor._host_i64[0, 0].item() == 4
+    assert executor._host_i64[0, 1].item() == 7
+    assert executor._host_i64[0, 2].item() == 3

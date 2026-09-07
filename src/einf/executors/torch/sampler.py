@@ -5,12 +5,13 @@ from torch import Tensor
 
 @dataclass(frozen=True, slots=True)
 class SamplingBatch:
-    temperatures: Tensor
-    top_ks: Tensor
-    top_ps: Tensor
-    min_ps: Tensor
-    seeds: Tensor
-    offsets: Tensor
+    is_all_greedy: bool = False
+    temperatures: Tensor | None = None
+    top_ks: Tensor | None = None
+    top_ps: Tensor | None = None
+    min_ps: Tensor | None = None
+    seeds: Tensor | None = None
+    offsets: Tensor | None = None
 
 @dataclass(frozen=True, slots=True)
 class SamplingOutput:
@@ -19,15 +20,27 @@ class SamplingOutput:
 
 class Sampler:
     def sample(self, logits: Tensor, batch: SamplingBatch) -> SamplingOutput:
-        logits = logits.to(torch.float32)
         batch_size, vocab_size = logits.shape
-        
+
         if batch_size == 0:
             return SamplingOutput(
                 token_ids=torch.empty(0, dtype=torch.long, device=logits.device),
                 logprobs=torch.empty(0, dtype=torch.float32, device=logits.device),
             )
 
+        if batch.is_all_greedy:
+            return SamplingOutput(token_ids=logits.argmax(dim=-1), logprobs=None)
+        if (
+            batch.temperatures is None
+            or batch.top_ks is None
+            or batch.top_ps is None
+            or batch.min_ps is None
+            or batch.seeds is None
+            or batch.offsets is None
+        ):
+            raise ValueError("non-greedy SamplingBatch requires parameter tensors")
+
+        logits = logits.to(torch.float32)
         is_greedy = batch.temperatures == 0.0
 
         temperatures = torch.where(

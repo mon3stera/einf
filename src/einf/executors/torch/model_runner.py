@@ -1,7 +1,10 @@
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 
 from einf.cache.storage import TorchKVCacheStorage
 from einf.config import ModelConfig
@@ -105,6 +108,47 @@ def build_causal_mask(
         dtype=dtype,
     )
     return mask.masked_fill(allowed, 0.0)
+
+
+def _sdpa_kernel_context(tensor: Tensor):
+    if not tensor.is_cuda:
+        return nullcontext()
+    return sdpa_kernel(
+        [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ]
+    )
+
+
+def scaled_dot_product_attention(
+    Q: Tensor,
+    K: Tensor,
+    V: Tensor,
+    *,
+    scale: float,
+) -> Tensor:
+    """Lower-right causal GQA attention.
+
+    Q is ``[q_len, num_qo_heads, head_dim]``; K/V are
+    ``[kv_len, num_kv_heads, head_dim]``. The returned tensor matches Q.
+    Flash SDPA is preferred on CUDA; CPU uses the math kernel.
+    """
+    q_len = Q.size(0)
+    kv_len = K.size(0)
+    with _sdpa_kernel_context(Q):
+        output = torch.nn.functional.scaled_dot_product_attention(
+            Q.transpose(0, 1).unsqueeze(0),
+            K.transpose(0, 1).unsqueeze(0),
+            V.transpose(0, 1).unsqueeze(0),
+            attn_mask=causal_lower_right(q_len, kv_len),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+            enable_gqa=True,
+        )
+    return output.squeeze(0).transpose(0, 1)
 
 
 class SingleLayer(nn.Module):

@@ -1,6 +1,7 @@
 import torch
 
-from einf.executors.torch.input import ModelInput
+from einf.executors.torch.flashinfer_attn import build_paged_kv_csr
+from einf.executors.torch.input import ModelInput, ModelInputPool
 from einf.scheduler import ScheduledBatch, ScheduledRequest, WorkType
 
 
@@ -220,3 +221,103 @@ def test_host_metadata_matches_device_tensors() -> None:
     assert len(model_input.context_lens_host) == len(batch.requests)
     assert all(type(value) is int for value in model_input.query_start_loc_host)
     assert all(type(value) is int for value in model_input.context_lens_host)
+
+
+POOL_BATCH = ScheduledBatch(
+    step_id=0,
+    requests=(
+        make_request("a", (1, 2, 3), 0, (0, 1)),
+        make_request("b", (4,), 5, (2, 3, 4), work_type=WorkType.DECODE),
+        make_request("c", (6, 7), 2, (5, 6)),
+    ),
+)
+
+FIELDS = (
+    "input_token_ids",
+    "position",
+    "slot_mapping",
+    "query_start_loc",
+    "block_tables",
+    "context_lens",
+)
+
+
+def test_model_input_pool_matches_from_plan() -> None:
+    pool = ModelInputPool(torch.device("cpu"))
+    pooled = pool.build(POOL_BATCH, block_len=2)
+    reference = ModelInput.from_plan(POOL_BATCH, block_len=2, device=torch.device("cpu"))
+
+    for field in FIELDS:
+        assert torch.equal(getattr(pooled, field), getattr(reference, field)), field
+    assert pooled.query_start_loc_host == reference.query_start_loc_host
+    assert pooled.context_lens_host == reference.context_lens_host
+
+
+def test_model_input_pool_builds_flashinfer_csr() -> None:
+    pool = ModelInputPool(torch.device("cpu"))
+    pooled = pool.build(POOL_BATCH, block_len=2)
+    reference = ModelInput.from_plan(POOL_BATCH, block_len=2, device=torch.device("cpu"))
+
+    qo_indptr, kv_indptr, kv_indices, last_page_len = pooled.flashinfer_csr
+    reference_indptr, reference_indices, reference_last_page = build_paged_kv_csr(
+        reference.block_tables,
+        reference.context_lens,
+        block_len=2,
+    )
+
+    assert qo_indptr.dtype is torch.int32
+    assert qo_indptr.tolist() == reference.query_start_loc.tolist()
+    assert kv_indptr.tolist() == reference_indptr.tolist()
+    assert kv_indices.tolist() == reference_indices.tolist()
+    assert last_page_len.tolist() == reference_last_page.tolist()
+
+
+def test_model_input_pool_reuses_buffers_across_shapes() -> None:
+    pool = ModelInputPool(torch.device("cpu"))
+    pool.build(POOL_BATCH, block_len=2)
+    assert pool._allocations == 1
+
+    bigger = ScheduledBatch(
+        step_id=1,
+        requests=(
+            make_request("x", tuple(range(10)), 7, (9, 8, 7, 6, 5)),
+            make_request("y", (11,), 15, (5, 4, 3, 2), work_type=WorkType.DECODE),
+        ),
+    )
+    pooled_second = pool.build(bigger, block_len=4)
+    reference = ModelInput.from_plan(bigger, block_len=4, device=torch.device("cpu"))
+
+    # The second shape fits the first allocation, so the buffers are reused.
+    assert pool._allocations == 1
+    for field in FIELDS:
+        assert torch.equal(getattr(pooled_second, field), getattr(reference, field)), field
+
+    largest = ScheduledBatch(
+        step_id=2,
+        requests=(make_request("z", tuple(range(80)), 0, tuple(range(39, -1, -1))),),
+    )
+    pooled_third = pool.build(largest, block_len=2)
+    reference_third = ModelInput.from_plan(largest, block_len=2, device=torch.device("cpu"))
+
+    # Growing past capacity replaces the buffers but keeps the values correct.
+    assert pool._allocations == 2
+    for field in FIELDS:
+        assert torch.equal(getattr(pooled_third, field), getattr(reference_third, field)), field
+
+
+def test_model_input_pool_rejects_short_block_table() -> None:
+    pool = ModelInputPool(torch.device("cpu"))
+    batch = ScheduledBatch(
+        step_id=2,
+        requests=(
+            # context_len 8 needs 4 pages at block_len 2; the table has one.
+            make_request("short", (1,), 7, (7,)),
+        ),
+    )
+
+    try:
+        pool.build(batch, block_len=2)
+    except ValueError as error:
+        assert "shorter than the paged context" in str(error)
+    else:
+        raise AssertionError("expected a ValueError for a short block table")

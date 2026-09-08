@@ -60,13 +60,16 @@ def main() -> None:
     mask = torch.zeros(qo, kv, dtype=torch.bool)
     for node in range(qo):
         mask[node, : 14 + 1] = True  # history + pending
+
         if node > 0:
-            walk = node
+            if node in col_of:
+                mask[node, col_of[node]] = True
+
+            walk = (node - 1) // 2
+
             while walk in col_of:
                 mask[node, col_of[walk]] = True
                 walk = (walk - 1) // 2
-            mask[node, col_of[node]] = True
-    mask[node, 14] = True
 
     packed = pack_mask_flashinfer(mask.numpy())
 

@@ -516,9 +516,12 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         return spec, root_row, draft_rows
 
     def _draft_forward_q1(self, draft: _Track):
-        """q=1 forward processing the draft's pending token at live_tail."""
-        model_input = self._make_input(draft, [draft.pending_token])
-        return draft.forward(model_input)
+        """q=1 forward processing the draft's pending token at live_tail.
+
+        Routes through the chain engine's decode path so the runner's
+        captured q=1 CUDA graph applies, exactly like the chain loop.
+        """
+        return self._draft_decode_forward(draft, draft.pending_token)
 
     # ------------------------------------------------------------------
     # step

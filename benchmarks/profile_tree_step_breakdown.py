@@ -68,21 +68,25 @@ def instrument(engine, state: dict) -> None:
     target_track = engine._target
 
     if state["engine"] == "tree":
+        orig_expand = engine._expand_draft
+
         def expand_wrapper(*args, **kwargs):
             state["in_expand"] = True
 
             try:
-                return engine._expand_draft(*args, **kwargs)
+                return orig_expand(*args, **kwargs)
             finally:
                 state["in_expand"] = False
 
         engine._expand_draft = expand_wrapper
 
+        orig_q1 = engine._draft_forward_q1
+
         def q1_wrapper(*args, **kwargs):
             state["in_q1"] = True
 
             try:
-                return engine._draft_forward_q1(*args, **kwargs)
+                return orig_q1(*args, **kwargs)
             finally:
                 state["in_q1"] = False
 

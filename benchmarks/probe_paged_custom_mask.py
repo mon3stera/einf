@@ -71,7 +71,8 @@ def main() -> None:
                 mask[node, col_of[walk]] = True
                 walk = (walk - 1) // 2
 
-    packed = pack_mask_flashinfer(mask)
+    packed = pack_mask_flashinfer(mask).to(DEVICE)
+    mask = mask.to(DEVICE)
 
     q = torch.randn(qo, heads, dim, dtype=torch.bfloat16, device=DEVICE)
     kv_cache = torch.randn(

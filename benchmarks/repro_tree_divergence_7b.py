@@ -172,6 +172,7 @@ def diagnose_row(
         positions.append(spec.rope_pos(j))
         _emit_row(tokens, positions, reference)
         _compare(r, logits, reference, f"node {j}")
+        _compare_kv(spec, j, snapshot, reference, len(tokens))
 
         base = 2000
         model_input = ModelInput(
@@ -187,6 +188,32 @@ def diagnose_row(
             context_lens_host=(len(tokens),),
         )
     print(f"rows mismatched: {diagnose_row.mismatches}/{spec.total_q}", flush=True)
+
+
+def _compare_kv(
+    spec,
+    j: int,
+    snapshot: dict,
+    reference: QwenModelRunner,
+    recompute_len: int,
+) -> None:
+    """Compare the engine cache's K/V for node j's slot (written by the
+    verify forward) against the reference recompute's K/V for the same
+    token at the same rope position."""
+    engine_cache = snapshot.get("engine_cache")
+
+    if engine_cache is None:
+        return
+
+    slot = spec.num_history + 1 + j
+    ek = engine_cache.K[0].reshape(NUM_BLOCKS * BLOCK_LEN, -1)[slot].float()
+    ev = engine_cache.V[0].reshape(NUM_BLOCKS * BLOCK_LEN, -1)[slot].float()
+    ref_slot = 2000 + recompute_len - 1
+    rk = reference.cache.K[0].reshape(NUM_BLOCKS * BLOCK_LEN, -1)[ref_slot].float()
+    rv = reference.cache.V[0].reshape(NUM_BLOCKS * BLOCK_LEN, -1)[ref_slot].float()
+    dk = float((ek - rk).abs().max())
+    dv = float((ev - rv).abs().max())
+    print(f"    kv node {j:2d} slot {slot}: dK={dk:.4f} dV={dv:.4f}", flush=True)
 
 
 def _emit_row(tokens: list[int], positions: list[int], reference: QwenModelRunner) -> None:
@@ -341,6 +368,7 @@ def main() -> None:
             snapshot["live"] = engine._target.context_len
             committed = engine.step(greedy=True)
             snapshot.update(spec=engine._last_tree[0], logits=engine._last_tree[2])
+            snapshot["engine_cache"] = engine._target.runner.cache
             generated.extend(committed)
 
             # first cache-corruption step: compare committed region and

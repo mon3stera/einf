@@ -263,6 +263,20 @@ def main() -> None:
     args = [a for a in sys.argv[1:]]
     w4a16 = "--bf16" not in args
     custom_ops = "--no-custom-ops" not in args
+
+    tol = 1e-2
+    engine_kind = "tree"
+
+    if "--tol" in args:
+        i = args.index("--tol")
+        tol = float(args[i + 1])
+        args = args[:i] + args[i + 2 :]
+
+    if "--engine" in args:
+        i = args.index("--engine")
+        engine_kind = args[i + 1]
+        args = args[:i] + args[i + 2 :]
+
     args = [a for a in args if not a.startswith("--")]
     target_dir, draft_dir = Path(args[0]), Path(args[1])
     budget = int(args[2]) if len(args) > 2 else 16

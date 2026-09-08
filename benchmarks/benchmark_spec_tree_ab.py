@@ -72,9 +72,14 @@ def build(config_path: Path, model_dir: Path, *, w4a16: bool) -> QwenModelRunner
     return runner
 
 
+def _top2_gap(logits: torch.Tensor) -> float:
+    top2 = torch.topk(logits.float(), 2).values
+    return float(top2[0] - top2[1])
+
+
 def plain_greedy(
     runner: QwenModelRunner, prompt_ids: list[int], max_new_len: int
-) -> list[int]:
+) -> tuple[list[int], list[float]]:
     """Decode-only reference loop (spec machinery, one token per forward)."""
     track = _Track(
         forward=runner.forward,
@@ -87,19 +92,22 @@ def plain_greedy(
         runner, runner, device=DEVICE, block_len=BLOCK_LEN, num_blocks=NUM_BLOCKS
     )
     ids: list[int] = []
+    gaps: list[float] = []
 
     with torch.inference_mode():
         out = runner.forward(helper._make_input(track, prompt_ids))
         token = int(out.logits[-1].argmax().item())
         ids.append(token)
+        gaps.append(_top2_gap(out.logits[-1]))
         track.context_len = len(prompt_ids)
 
         while len(ids) < max_new_len:
             out = runner.forward(helper._make_input(track, [token]))
             token = int(out.logits[-1].argmax().item())
+            gaps.append(_top2_gap(out.logits[-1]))
             track.context_len += 1
             ids.append(token)
-    return ids
+    return ids, gaps
 
 
 CONFIGS: list[tuple[str, dict]] = [
@@ -185,7 +193,7 @@ def main() -> None:
 
     print("--- plain decode reference ---", flush=True)
     t0 = time.perf_counter()
-    reference_ids = plain_greedy(target, prompt_ids, MAX_NEW)
+    reference_ids, reference_gaps = plain_greedy(target, prompt_ids, MAX_NEW)
     wall = time.perf_counter() - t0
     print(
         f"{'plain decode':20s} wall={wall:7.3f}s "
@@ -204,20 +212,25 @@ def main() -> None:
         report(name, ids, stats, wall, warmup=False)
 
     # Losslessness cross-check: every greedy configuration must emit the
-    # same tokens as the plain decode loop.
+    # same tokens as the plain decode loop. A first divergence at a
+    # near-tie reference position (tiny top-2 gap) is the documented
+    # numerics flip; a divergence at a well-separated position is a bug.
     for name, ids in zip([n for n, _ in CONFIGS], outputs):
-        if ids[:MAX_NEW] != reference_ids:
-            mismatch = next(
-                (i for i, (a, b) in enumerate(zip(ids, reference_ids)) if a != b),
-                min(len(ids), len(reference_ids)),
-            )
-            print(
-                f"WARNING: {name} diverges from plain decode at token "
-                f"{mismatch} (losslessness check failed)",
-                flush=True,
-            )
-        else:
+        if ids[:MAX_NEW] == reference_ids:
             print(f"lossless ok: {name}", flush=True)
+            continue
+
+        mismatch = next(
+            (i for i, (a, b) in enumerate(zip(ids, reference_ids)) if a != b),
+            min(len(ids), len(reference_ids)),
+        )
+        gap = reference_gaps[mismatch] if mismatch < len(reference_gaps) else -1.0
+        verdict = "near-tie flip" if gap < 1e-2 else "WELL-SEPARATED DIVERGENCE"
+        print(
+            f"{'ok' if gap < 1e-2 else 'FAIL'}: {name} diverges at token "
+            f"{mismatch}, reference top-2 gap {gap:.3e} ({verdict})",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ def _tiny_runner(device: torch.device, seed: int) -> QwenModelRunner:
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
         ),
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=device,
         use_custom_ops=False,
     )
@@ -67,7 +67,10 @@ def _tiny_runner(device: torch.device, seed: int) -> QwenModelRunner:
             )
     finally:
         torch.set_default_dtype(previous)
-    return runner.eval()
+
+    # init in fp32 for stable seeding, then cast: FlashInfer's JIT kernel
+    # map has no fp32 entry, so the runners must run bf16
+    return runner.to(device=device, dtype=torch.bfloat16).eval()
 
 
 def _plain_greedy(
@@ -130,7 +133,7 @@ def test_tree_engine_flashinfer_matches_plain_loop():
     # numerics caveat as the chain GPU test)
     diverged = [i for i, (a, b) in enumerate(zip(tree_ids, plain_ids)) if a != b]
     for i in diverged:
-        assert plain_gaps[i] < 1e-3, (
+        assert plain_gaps[i] < 1e-2, (
             f"divergence at {i} with well-separated logits "
             f"(gap={plain_gaps[i]:.3e})"
         )

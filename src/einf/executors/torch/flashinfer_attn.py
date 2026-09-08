@@ -178,7 +178,9 @@ class FlashInferPagedAttention:
         packed_mask = model_input.packed_mask
 
         if packed_mask is not None:
-            if packed_mask.device != qo_indptr.device:
+            # The CSR may now be pinned host staging; the mask must live on
+            # the device the attention kernel runs on.
+            if packed_mask.device != model_input.context_lens.device:
                 raise ValueError("packed_mask must live on the plan device")
             # Host metadata avoids two device reads (implicit syncs) per
             # plan() on the packed-mask path.

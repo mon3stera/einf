@@ -47,6 +47,12 @@ class ModelInput:
     # Only builders that construct inputs from host-side state (the pool and
     # the speculative engine) may set it.
     is_decode_only: bool = False
+    # Packed custom mask for tree speculation (spec_tree.pack_mask_flashinfer):
+    # a bit-per-entry ``[total_q, context + total_q]`` visibility matrix that
+    # replaces the causal assumption for this forward. ``None`` keeps the
+    # standard causal path. The FlashInfer plan() wiring is deferred to the
+    # GPU milestone of tree speculation.
+    packed_mask: Tensor | None = None
 
     @classmethod
     def from_plan(cls, plan: BatchPlan, *, block_len: int, device: torch.device) -> "ModelInput":

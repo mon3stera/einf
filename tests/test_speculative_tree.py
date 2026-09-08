@@ -178,11 +178,17 @@ def test_find_greedy_path_root_divergence():
 
 
 def _fake_storage(layers: int = 2, blocks: int = 4, block_len: int = 4) -> SimpleNamespace:
-    shape = (layers, blocks * block_len, 2, 3)
+    # block-structured layout matching TorchKVCacheStorage:
+    # [layers, blocks, block_len, kv_heads, head_dim]
+    shape = (layers, blocks, block_len, 2, 3)
     return SimpleNamespace(
         K=torch.zeros(shape),
         V=torch.zeros(shape),
     )
+
+
+def _slot(tensor: torch.Tensor, slot: int, block_len: int = 4) -> torch.Tensor:
+    return tensor[:, slot // block_len, slot % block_len]
 
 
 def test_gather_commit_kv_moves_and_is_collision_free():
@@ -193,18 +199,18 @@ def test_gather_commit_kv_moves_and_is_collision_free():
     storage = _fake_storage()
     for layer in range(storage.K.shape[0]):
         for slot in range(16):
-            storage.K[layer, slot] = float(slot)
-            storage.V[layer, slot] = -float(slot)
+            _slot(storage.K, slot)[layer] = float(slot)
+            _slot(storage.V, slot)[layer] = -float(slot)
 
     gather_commit_kv(storage, src_slots=[6, 8], dst_slots=[5, 6])
 
     for layer in range(storage.K.shape[0]):
-        assert storage.K[layer, 5].equal(torch.full((2, 3), 6.0))
-        assert storage.K[layer, 6].equal(torch.full((2, 3), 8.0))
-        assert storage.V[layer, 5].equal(torch.full((2, 3), -6.0))
-        assert storage.V[layer, 6].equal(torch.full((2, 3), -8.0))
+        assert _slot(storage.K, 5)[layer].equal(torch.full((2, 3), 6.0))
+        assert _slot(storage.K, 6)[layer].equal(torch.full((2, 3), 8.0))
+        assert _slot(storage.V, 5)[layer].equal(torch.full((2, 3), -6.0))
+        assert _slot(storage.V, 6)[layer].equal(torch.full((2, 3), -8.0))
         # untouched slots stay put
-        assert storage.K[layer, 7].equal(torch.full((2, 3), 7.0))
+        assert _slot(storage.K, 7)[layer].equal(torch.full((2, 3), 7.0))
 
 
 def test_gather_commit_kv_empty_and_identity():

@@ -304,8 +304,10 @@ def gather_commit_kv(storage: object, src_slots: list[int], dst_slots: list[int]
 
     for layer in range(storage.K.shape[0]):
         for cache in (storage.K, storage.V):
-            # cache[layer] is [slots, kv_heads, head_dim] — flatten slots only
-            flat = cache[layer].view(-1, *cache[layer].shape[1:])
+            # cache[layer] is block-structured [blocks, block_len, kv_heads,
+            # head_dim]; flatten the two slot dims while keeping per-head
+            # vectors so slot indices stay block*block_len + offset.
+            flat = cache[layer].reshape(-1, *cache[layer].shape[-2:])
             flat[dst] = flat[src]
 
 

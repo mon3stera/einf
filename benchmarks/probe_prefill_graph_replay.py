@@ -55,18 +55,31 @@ def main() -> None:
     )
 
     # FlashInfer's CUDA-graph mode: persistent buffers the captured kernels
-    # read at replay time, so plan() can stay outside the graph and replays
-    # need no re-planning.
+    # read at replay time. plan() in graph mode does NOT copy the plan
+    # inputs into these buffers (it only validates sizes), so the caller
+    # must initialize them directly — zeros here would hand the kernel an
+    # empty page range and produce NaN.
+    qo_indptr_buf = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    kv_indptr_buf = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    indices_buf = torch.zeros(8, dtype=torch.int32, device=DEVICE)
+    lpl_buf = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    mask_indptr_buf = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    qo_indptr_buf[1] = qo
+    kv_indptr_buf[1] = pages_max
+    indices_buf[:pages_max] = torch.arange(pages_max, dtype=torch.int32)
+    lpl_buf[0] = kv_max - (pages_max - 1) * page
+    mask_indptr_buf[1] = mask_buf.numel()
+
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace,
         "NHD",
         use_cuda_graph=True,
-        qo_indptr_buf=torch.zeros(2, dtype=torch.int32, device=DEVICE),
-        paged_kv_indptr_buf=torch.zeros(2, dtype=torch.int32, device=DEVICE),
-        paged_kv_indices_buf=torch.zeros(8, dtype=torch.int32, device=DEVICE),
-        paged_kv_last_page_len_buf=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        qo_indptr_buf=qo_indptr_buf,
+        paged_kv_indptr_buf=kv_indptr_buf,
+        paged_kv_indices_buf=indices_buf,
+        paged_kv_last_page_len_buf=lpl_buf,
         custom_mask_buf=mask_buf,
-        mask_indptr_buf=torch.zeros(2, dtype=torch.int32, device=DEVICE),
+        mask_indptr_buf=mask_indptr_buf,
     )
 
     def plan_and_fill(kv: int) -> None:

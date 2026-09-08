@@ -98,7 +98,7 @@ def main() -> None:
     )
     result = wrapper.run(q, kv_cache).float()
 
-    k, v = kv_cache[:, 0], kv_cache[:, 1]
+    k, v = kv_cache[0, 0], kv_cache[0, 1]
     reference = manual_attention(q, k, v, mask, sm_scale)
     diff = (result - reference).abs()
     per_row = diff.amax(dim=(1, 2))

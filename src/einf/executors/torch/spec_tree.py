@@ -318,8 +318,18 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         *,
         greedy: bool,
         generator: torch.Generator | None,
-    ) -> tuple[TreeSpec, torch.Tensor]:
-        """Build the tree on the draft track; returns (spec, root_row).
+    ) -> tuple[TreeSpec, torch.Tensor, torch.Tensor]:
+        """Build the tree on the draft track.
+
+        Returns ``(spec, root_row, draft_rows)`` where ``draft_rows`` is
+        ``[1 + T, V]`` aligned with the verify forward's row indexing: row 0
+        is the draft distribution at the pending context (it proposed the
+        root children), row ``1 + j`` is the draft distribution at node j's
+        context (it proposed j's children). Nodes appended at the final
+        depth never get forwarded (nothing beyond them can be proposed), so
+        their rows are ``-inf`` placeholders — a correct verifier never
+        reads them, because a leaf ends the walk with a bonus drawn from
+        the target row and no residual.
 
         Level 1 candidates come from the pending token's row (one q=1
         forward); each later level is one batched forward over that level's
@@ -343,6 +353,7 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         spec = TreeSpec(num_history=live)
         root_row = None
         level: list[int] = []
+        node_rows: dict[int, torch.Tensor] = {}
 
         for depth in range(1, self._max_depth + 1):
             if depth == 1:
@@ -372,6 +383,9 @@ class TreeSpeculativeEngine(SpeculativeEngine):
                 out = draft.forward(model_input)
                 parents = level
                 rows = [out.logits[i].detach().float() for i in range(len(level))]
+
+                for j, row in zip(level, rows):
+                    node_rows[j] = row
 
             # Collect candidates: top-k children per node in this level.
             candidates: list[tuple[float, int, int | None]] = []
@@ -408,7 +422,14 @@ class TreeSpeculativeEngine(SpeculativeEngine):
 
             level = new_level
 
-        return spec, root_row
+        vocab = root_row.numel()
+        draft_rows = torch.full((spec.total_q, vocab), float("-inf"))
+        draft_rows[0] = root_row
+
+        for j, row in node_rows.items():
+            draft_rows[1 + j] = row
+
+        return spec, root_row, draft_rows
 
     def _draft_forward_q1(self, draft: _Track):
         """q=1 forward processing the draft's pending token at live_tail."""
@@ -434,7 +455,7 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         if kwargs:
             raise TypeError(f"unexpected step arguments: {sorted(kwargs)}")
 
-        spec, root_row = self._expand_draft(
+        spec, root_row, draft_rows = self._expand_draft(
             greedy=greedy, generator=generator
         )
 
@@ -489,5 +510,5 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         self._stats.proposed += len(spec.tokens)
         self._stats.accepted += num_accepted
         self._stats.committed += len(committed)
-        self._last_tree = (spec, root_row, logits)
+        self._last_tree = (spec, draft_rows, logits)
         return committed

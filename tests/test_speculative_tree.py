@@ -286,11 +286,16 @@ def test_tree_engine_records_last_tree():
     )
     engine.generate([5], max_new_len=2, greedy=True)
 
-    spec, root_row, verify_logits = engine._last_tree
+    spec, draft_rows, verify_logits = engine._last_tree
 
-    assert spec is not None and root_row is not None
-    # verify rows: pending + every tree node, one distribution each
+    assert spec is not None
+    # verify rows: pending + every tree node, one distribution each;
+    # draft rows share the indexing (max-depth leaves may be -inf)
     assert verify_logits.shape[0] == spec.total_q
+    assert draft_rows.shape == verify_logits.shape
+    # the root row is a real distribution (raw logits may hold -inf entries
+    # elsewhere; only all--inf placeholder rows are never finite anywhere)
+    assert torch.isfinite(draft_rows[0]).any()
     # the tree is non-trivial: at least one depth-2 node exists
     assert max(spec.depths) == 2
 

@@ -148,6 +148,66 @@ def build_tree_mask_reference(spec: TreeSpec) -> torch.Tensor:
     return mask
 
 
+def build_tree_mask(spec: TreeSpec) -> torch.Tensor:
+    """Vectorized tree-mask builder: unpack each node's O(1) visibility
+    bitmask instead of walking ancestor chains. Must stay bit-identical to
+    ``build_tree_mask_reference`` (the oracle tests enforce this).
+
+    Row 0 is the pending token (history + itself); row 1+j is node j, whose
+    ``node_masks[j]`` encodes pending + ancestors + self as bits 0..T.
+    """
+    t = len(spec.tokens)
+    total_q, total_kv = 1 + t, spec.num_history + 1 + t
+    mask = torch.zeros((total_q, total_kv), dtype=torch.bool)
+
+    mask[:, : spec.num_history] = True
+    mask[0, spec.num_history] = True
+
+    bits = torch.tensor(spec.node_masks, dtype=torch.int64)
+    cols = torch.arange(1, t + 1)
+    node_block = (bits.unsqueeze(-1) >> cols) & 1
+    mask[1:, spec.num_history + 1 :] = node_block.bool()
+
+    # bit 0 of every node mask is the pending token, already written to the
+    # cache before the verify forward, so every node row sees it
+    mask[1:, spec.num_history] = True
+    return mask
+
+
+def tree_verify_sampling(
+    target_logits: torch.Tensor,
+    spec: TreeSpec,
+    generator: torch.Generator | None = None,
+) -> tuple[list[int], list[int]]:
+    """Naive-sampling tree verification (SpecInfer's acknowledged-exact NS).
+
+    At each reached row, sample the next token from the target's own
+    distribution; if it names a child, descend (the child's KV is already
+    computed); otherwise the sample IS the correction token. A leaf has no
+    children, so its row's sample always terminates the walk as the bonus.
+    Exactly follows the target's autoregressive distribution by construction;
+    each reached child is emitted at its information-theoretic cap p(c).
+
+    Returns ``(path, committed)`` — same contract as ``find_greedy_path``,
+    whose argmax walk is the deterministic special case.
+    """
+    u, path, committed = None, [], []
+
+    while True:
+        row = 0 if u is None else u + 1
+        s = int(torch.multinomial(torch.softmax(target_logits[row], dim=-1), 1, generator=generator))
+        kids = spec.children(u)
+        match = next((c for c in kids if spec.tokens[c] == s), None)
+
+        if match is None:
+            committed.append(s)
+            return path, committed
+
+        path.append(match)
+        committed.append(s)
+        u = match
+
+
 def pack_mask_flashinfer(mask: torch.Tensor) -> torch.Tensor:
     """Pack a bool ``[total_q, total_kv]`` mask for FlashInfer's
     ``packed_custom_mask`` (bit-per-entry, little bit order — the phase-0
@@ -447,11 +507,6 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         generator: torch.Generator | None = None,
         **kwargs,
     ) -> list[int]:
-        if not greedy:
-            raise NotImplementedError(
-                "tree sampling verification is phase 3a; greedy only for now"
-            )
-
         if kwargs:
             raise TypeError(f"unexpected step arguments: {sorted(kwargs)}")
 
@@ -479,7 +534,13 @@ class TreeSpeculativeEngine(SpeculativeEngine):
             )
         )
         logits = out.logits.detach().float()
-        path, committed = find_greedy_path(logits, spec)
+
+        if greedy:
+            path, committed = find_greedy_path(logits, spec)
+        else:
+            path, committed = tree_verify_sampling(
+                logits, spec, generator=generator
+            )
 
         # Gather commit on both caches (skip when the runner owns no storage).
         live_slots = [live + 1 + j for j in path]

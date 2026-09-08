@@ -300,19 +300,93 @@ def test_tree_engine_records_last_tree():
     assert max(spec.depths) == 2
 
 
-def test_tree_engine_sampling_deferred():
-    runner = DeterministicModelRunner(vocab_size=VOCAB)
-    engine = TreeSpeculativeEngine(
-        runner, runner, device=torch.device("cpu"), tree_budget=2, max_depth=1,
-    )
-    engine.prefill([5], greedy=True)
+def test_build_tree_mask_matches_reference_random_trees():
+    """The vectorized bitmask unpacking must be bit-identical to the
+    ancestor-walk oracle on arbitrary tree shapes (any node may parent)."""
+    import random
 
-    try:
-        engine.step(greedy=False)
-    except NotImplementedError as exc:
-        assert "3a" in str(exc)
-    else:
-        raise AssertionError("sampling verify must be deferred to 3a")
+    from einf.executors.torch.spec_tree import build_tree_mask
+
+    rng = random.Random(7)
+
+    for _ in range(30):
+        spec = TreeSpec(num_history=rng.randrange(0, 40))
+        for _ in range(rng.randrange(1, 13)):
+            parent = (
+                None
+                if not spec.tokens or rng.random() < 0.3
+                else rng.randrange(len(spec.tokens))
+            )
+            spec.append(parent, rng.randrange(1000), rng.random())
+
+        assert torch.equal(build_tree_mask(spec), build_tree_mask_reference(spec))
+
+
+def test_tree_engine_sampling_one_hot_matches_greedy():
+    """One-hot logits make multinomial degenerate to argmax, so the NS
+    sampling walk must reproduce the greedy closed form exactly."""
+    runner = DeterministicModelRunner(vocab_size=VOCAB)
+    gen = torch.Generator().manual_seed(0)
+
+    sample_engine = TreeSpeculativeEngine(
+        runner, runner, device=torch.device("cpu"),
+        tree_budget=4, branch_factor=2, max_depth=2,
+    )
+    greedy_engine = TreeSpeculativeEngine(
+        runner, runner, device=torch.device("cpu"),
+        tree_budget=4, branch_factor=2, max_depth=2,
+    )
+    sample_ids, _ = sample_engine.generate(
+        [3, 1, 4], max_new_len=10, greedy=False, generator=gen
+    )
+    greedy_ids, _ = greedy_engine.generate([3, 1, 4], max_new_len=10, greedy=True)
+
+    assert sample_ids == greedy_ids == [(5 + i) % VOCAB for i in range(10)]
+
+
+def test_tree_verify_sampling_marginals():
+    """The forcing theorem: each reached child is emitted exactly at its
+    target probability, and the correction absorbs the remaining mass."""
+    from einf.executors.torch.spec_tree import tree_verify_sampling
+
+    # vocab 4; root row (0.5, 0.3, 0.2, 0); children {0, 1};
+    # node 0 (token 0) has child {2} and its row gives 2 w.p. 0.9.
+    spec = TreeSpec(num_history=0)
+    spec.append(None, 0, -0.7)
+    spec.append(None, 1, -1.2)
+    spec.append(0, 2, -1.5)
+    root = torch.log(torch.tensor([0.5, 0.3, 0.2, 0.0]))
+    node0 = torch.log(torch.tensor([0.02, 0.03, 0.9, 0.05]))
+    node1 = torch.log(torch.tensor([0.25, 0.25, 0.25, 0.25]))
+    node2 = torch.log(torch.tensor([0.1, 0.1, 0.1, 0.7]))
+    logits = torch.stack([root, node0, node1, node2])
+
+    gen = torch.Generator().manual_seed(1234)
+    trials = 6000
+    first = [0, 0, 0, 0]
+    walked_via_0 = 0
+    committed_2_after_0 = 0
+
+    for _ in range(trials):
+        path, committed = tree_verify_sampling(logits, spec, generator=gen)
+        first[committed[0]] += 1
+
+        if path and path[0] == 0:
+            walked_via_0 += 1
+
+            if len(path) > 1 and path[1] == 2:
+                committed_2_after_0 += 1
+
+        # path tokens must equal the committed prefix (structural invariant)
+        assert [spec.tokens[j] for j in path] == committed[: len(path)]
+
+    # forcing theorem: emission of each child = its target probability
+    assert abs(first[0] / trials - 0.5) < 0.03
+    assert abs(first[1] / trials - 0.3) < 0.03
+    # corrections (2 and 3) absorb the remaining 0.2
+    assert abs((first[2] + first[3]) / trials - 0.2) < 0.03
+    # conditional: from node 0, child 2 is emitted at 0.9
+    assert abs(committed_2_after_0 / walked_via_0 - 0.9) < 0.04
 
 
 def test_chain_engine_unaffected_by_tree_module():

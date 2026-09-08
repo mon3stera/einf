@@ -114,9 +114,14 @@ def main() -> None:
 
     print("captured at kv=64")
 
-    # ---- replay at smaller kv: refill mask + indptr/lpl only ----
+    # ---- replay at smaller kv: refill ONLY the mask (False beyond the
+    # actual kv); the captured plan stays at bucket-max kv and its extra
+    # tiles are neutralized by the mask plus zero cache rows ----
     for kv in (40, 30):
-        plan_and_fill(kv)  # refresh wrapper device plan buffers for this kv
+        mask = build_mask(qo, kv)
+        packed = pack_mask_flashinfer(mask).to(DEVICE)
+        mask_buf.zero_()
+        mask_buf[: packed.numel()] = packed
         graph.replay()
         torch.cuda.synchronize()
 

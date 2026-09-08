@@ -144,6 +144,19 @@ def main() -> None:
     diff = (static_out.float() - references[kv_max].float()).abs().max()
     print(f"replay at kv=64 (capture kv): max diff {diff.item():.4f}")
 
+    # three-way localization: is the WRAPPER state intact after capture?
+    plan_and_fill(kv_max)
+    eager_after = wrapper.run(
+        q_static, kv_cache[:, :, :pages_max * page]
+    ).clone()
+    torch.cuda.synchronize()
+    d_ref = (eager_after.float() - references[kv_max].float()).abs().max()
+    d_replay = (eager_after.float() - static_out.float()).abs().max()
+    print(
+        f"eager-after-capture vs reference: {d_ref.item():.4f}; "
+        f"vs replay: {d_replay.item():.4f}"
+    )
+
 
 if __name__ == "__main__":
     main()

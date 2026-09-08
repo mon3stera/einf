@@ -38,7 +38,11 @@ from dataclasses import dataclass, field
 import torch
 
 from einf.executors.torch.input import ModelInput
-from einf.executors.torch.spec_runner import SpeculativeEngine, _Track
+from einf.executors.torch.spec_runner import (
+    SpeculativeEngine,
+    _StepInputBuffers,
+    _Track,
+)
 
 
 @dataclass
@@ -375,24 +379,66 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         context_len: int,
         packed_mask: torch.Tensor | None,
     ) -> ModelInput:
+        """Build a tree forward's ModelInput from persistent staging.
+
+        Mirrors the chain engine's ``_make_input``: device tensors come from
+        per-(track, n) buffers reused across steps (stream-ordered in-place
+        reuse), and the FlashInfer CSR is built from host integers into the
+        track's pinned staging — plan() reads the pinned indptr directly with
+        no device round-trip, replacing the device-side ``_paged_csr``
+        fallback that synchronized four times per forward.
+        """
         n = len(token_ids)
         device = self._device
 
         if packed_mask is not None and packed_mask.device != device:
             packed_mask = packed_mask.to(device)
 
+        buf = track.buffers.get(n)
+
+        if buf is None:
+            buf = _StepInputBuffers(
+                token=torch.empty(n, dtype=torch.long, device=device),
+                position=torch.empty(n, dtype=torch.long, device=device),
+                slot=torch.empty(n, dtype=torch.long, device=device),
+                query_start_loc=torch.tensor(
+                    [0, n], dtype=torch.long, device=device
+                ),
+                context_lens=torch.empty(1, dtype=torch.long, device=device),
+                is_decode_only=False,
+            )
+            track.buffers[n] = buf
+
+        csr = self._ensure_track_constants(track)
+
+        if self._csr_fence is not None and not self._csr_fence.query():
+            self._csr_fence.synchronize()
+
+        pages = (context_len + self._block_len - 1) // self._block_len
+        csr.qo_np[1] = n
+        csr.kv_np[1] = pages
+        csr.lpl_np[0] = context_len - (pages - 1) * self._block_len
+        buf.context_lens.fill_(context_len)
+        buf.token.copy_(torch.tensor(token_ids, dtype=torch.long))
+        buf.position.copy_(torch.tensor(positions, dtype=torch.long))
+        buf.slot.copy_(torch.tensor(slots, dtype=torch.long))
+
         return ModelInput(
-            input_token_ids=torch.tensor(token_ids, dtype=torch.long, device=device),
-            position=torch.tensor(positions, dtype=torch.long, device=device),
-            slot_mapping=torch.tensor(slots, dtype=torch.long, device=device),
-            query_start_loc=torch.tensor([0, n], dtype=torch.long, device=device),
-            block_tables=track.block_tables_dev
-            if track.block_tables_dev is not None
-            else torch.zeros((1, 1), dtype=torch.long),
-            context_lens=torch.tensor([context_len], dtype=torch.long, device=device),
+            input_token_ids=buf.token,
+            position=buf.position,
+            slot_mapping=buf.slot,
+            query_start_loc=buf.query_start_loc,
+            block_tables=track.block_tables_dev,
+            context_lens=buf.context_lens,
             query_start_loc_host=(0, n),
             context_lens_host=(context_len,),
             packed_mask=packed_mask,
+            flashinfer_csr=(
+                csr.qo_indptr,
+                csr.kv_indptr,
+                csr.kv_indices_dev[:pages],
+                csr.last_page_len,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -465,6 +511,7 @@ class TreeSpeculativeEngine(SpeculativeEngine):
                     packed_mask=pack_mask_flashinfer(level_mask),
                 )
                 out = draft.forward(model_input)
+                self._fence_csr()
                 parents = level
                 rows = [out.logits[i].detach().float() for i in range(len(level))]
 
@@ -558,6 +605,7 @@ class TreeSpeculativeEngine(SpeculativeEngine):
                 packed_mask=packed_mask,
             )
         )
+        self._fence_csr()
         logits = out.logits.detach().float()
 
         if greedy:

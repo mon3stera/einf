@@ -180,8 +180,18 @@ class FlashInferPagedAttention:
         if packed_mask is not None:
             if packed_mask.device != qo_indptr.device:
                 raise ValueError("packed_mask must live on the plan device")
-            qo_total = int(model_input.query_start_loc[-1])
-            kv_total = int(model_input.context_lens.sum())
+            # Host metadata avoids two device reads (implicit syncs) per
+            # plan() on the packed-mask path.
+            qo_total = (
+                model_input.query_start_loc_host[1]
+                if model_input.query_start_loc_host is not None
+                else int(model_input.query_start_loc[-1])
+            )
+            kv_total = (
+                model_input.context_lens_host[0]
+                if model_input.context_lens_host is not None
+                else int(model_input.context_lens.sum())
+            )
             expected_bits = qo_total * kv_total
 
             if packed_mask.numel() * 8 < expected_bits:

@@ -168,15 +168,12 @@ def main() -> None:
         ref_track.context_len = len(prompt_ids)
         ref_state["logits"] = out.logits[-1]
 
+        first = engine.prefill(prompt_ids, greedy=True)
+        validate(first, len(generated))
+        generated.append(first)
+
         while len(generated) < max_new:
-            print(
-                f"step {engine._stats.steps}: pending(draft={engine._draft.pending_token}, "
-                f"target={engine._target.pending_token}) "
-                f"ctx(draft={engine._draft.context_len}, target={engine._target.context_len})",
-                flush=True,
-            )
             committed = engine.step(greedy=True)
-            print(f"  committed {committed}", flush=True)
 
             for token in committed:
                 validate(token, len(generated))

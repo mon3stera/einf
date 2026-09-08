@@ -92,6 +92,40 @@ def plain_greedy(runner: QwenModelRunner, prompt_ids: list[int], max_new_len: in
     return ids, gaps
 
 
+def diagnose_cache(
+    snapshot: dict, engine_cache, ref_cache
+) -> None:
+    """Compare the two caches slot-by-slot over the committed region:
+    both runners hold the same token ids at the same logical slots with the
+    same rope positions, so K/V should agree to bf16 numerics."""
+    spec = snapshot["spec"]
+    live_now = spec.total_kv if snapshot.get("spec") is not None else 0
+    # region committed BEFORE the failing step's verify wrote its scratch:
+    # everything except this step's scratch [live, live+1+T)
+    live = snapshot["live"]
+    span = live
+    for name, cache in (("engine", engine_cache), ("reference", ref_cache)):
+        print(
+            f"{name} cache K shape {tuple(cache.K.shape)} dtype {cache.K.dtype}",
+            flush=True,
+        )
+
+    ek = engine_cache.K[0].view(-1, *engine_cache.K.shape[2:])
+    rk = ref_cache.K[0].view(-1, *ref_cache.K.shape[2:])
+    ev = engine_cache.V[0].view(-1, *engine_cache.V.shape[2:])
+    rv = ref_cache.V[0].view(-1, *ref_cache.V.shape[2:])
+    diff_k = (ek[:span].float() - rk[:span].float()).abs().amax(dim=-1)
+    diff_v = (ev[:span].float() - rv[:span].float()).abs().amax(dim=-1)
+    bad_k = (diff_k > 1e-2).nonzero().flatten().tolist()
+    bad_v = (diff_v > 1e-2).nonzero().flatten().tolist()
+    print(
+        f"committed region [0, {span}): K bad slots {len(bad_k)} {bad_k[:12]} "
+        f"max diff {float(diff_k.max()):.4f}; V bad slots {len(bad_v)} "
+        f"{bad_v[:12]} max diff {float(diff_v.max()):.4f}",
+        flush=True,
+    )
+
+
 def diagnose_row(
     snapshot: dict,
     reference: QwenModelRunner,
@@ -263,6 +297,7 @@ def main() -> None:
 
     if invalid:
         diagnose_row(snapshot, reference, ref_helper, ref_track, prompt_ids, generated)
+        diagnose_cache(snapshot, engine._target.runner.cache, reference.cache)
 
     if not invalid:
         print(

@@ -74,8 +74,9 @@ def main() -> None:
     packed = pack_mask_flashinfer(mask)
 
     q = torch.randn(qo, heads, dim, dtype=torch.bfloat16, device=DEVICE)
-    k = torch.randn(1, page, kvh, dim, dtype=torch.bfloat16, device=DEVICE)
-    v = torch.randn(1, page, kvh, dim, dtype=torch.bfloat16, device=DEVICE)
+    kv_cache = torch.randn(
+        1, 2, page, kvh, dim, dtype=torch.bfloat16, device=DEVICE
+    )
 
     workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
@@ -95,9 +96,10 @@ def main() -> None:
         kv_data_type=torch.bfloat16,
         packed_custom_mask=packed,
     )
-    result = wrapper.run(q, k, v).float()
+    result = wrapper.run(q, kv_cache).float()
 
-    reference = manual_attention(q, k[:, :kv], v[:, :kv], mask, sm_scale)
+    k, v = kv_cache[:, 0], kv_cache[:, 1]
+    reference = manual_attention(q, k, v, mask, sm_scale)
     diff = (result - reference).abs()
     per_row = diff.amax(dim=(1, 2))
 

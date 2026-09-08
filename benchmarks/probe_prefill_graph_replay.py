@@ -149,6 +149,7 @@ def main() -> None:
         packed = pack_mask_flashinfer(mask).to(DEVICE)
         mask_buf.zero_()
         mask_buf[: packed.numel()] = packed
+        plan_and_fill(kv_max)  # sglang 2-step contract: re-plan before replay
         graph.replay()
         torch.cuda.synchronize()
 

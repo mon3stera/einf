@@ -327,7 +327,7 @@ def main() -> None:
         generated.append(first)
 
         while len(generated) < max_new:
-            generated.extend(engine.step(greedy=engine_kind == "tree"))
+            generated.extend(engine.step(greedy=True))
 
     generated = generated[:max_new]
     print(

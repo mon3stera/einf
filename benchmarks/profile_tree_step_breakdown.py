@@ -90,25 +90,25 @@ def instrument(engine, state: dict) -> None:
             finally:
                 state["in_q1"] = False
 
-        engine._draft_forward_q1 = timed("expand_q1", q1_wrapper, sync)
+        engine._draft_forward_q1 = q1_wrapper
 
-        draft_track.forward = timed("draft_fwd", draft_track.forward, sync)
         engine._make_tree_input = timed("tree_input", engine._make_tree_input, sync)
+
+        raw_draft_fwd = draft_track.forward
+        q1_fwd = timed("expand_q1_fwd", raw_draft_fwd, sync)
+        level_fwd = timed("expand_level", raw_draft_fwd, sync)
+        other_fwd = timed("draft_fwd", raw_draft_fwd, sync)
 
         def draft_router(*args, **kwargs):
             if state.get("in_q1"):
-                return draft_track.forward(*args, **kwargs)
+                return q1_fwd(*args, **kwargs)
 
             if state.get("in_expand"):
-                return timed("expand_level", draft_track.forward, sync)(
-                    *args, **kwargs
-                )
+                return level_fwd(*args, **kwargs)
 
-            return draft_track.forward(*args, **kwargs)
+            return other_fwd(*args, **kwargs)
 
-        # replace the raw forward with the routing wrapper
         draft_track.forward = draft_router
-        engine._draft.forward = draft_router
     else:
         engine._draft_decode_forward = timed("chain_draft", engine._draft_decode_forward, sync)
 
@@ -248,11 +248,12 @@ def main() -> None:
 
     order = [
         "step_total",
-        "expand_q1",
+        "expand_q1_fwd",
         "expand_level",
         "tree_input",
         "verify_fwd",
         "chain_draft",
+        "draft_fwd",
         "walk",
         "gather",
     ]

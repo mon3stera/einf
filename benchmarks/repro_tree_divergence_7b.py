@@ -383,28 +383,12 @@ def main() -> None:
             snapshot["engine_cache"] = engine._target.runner.cache
             generated.extend(committed)
 
-            # first cache-corruption step: compare committed region and
-            # diagnose THAT step's verify rows
-            live_now = engine._target.context_len
-            ek = engine._target.runner.cache.K[0].reshape(
-                NUM_BLOCKS * BLOCK_LEN, -1
-            )
-            rk = reference.cache.K[0].reshape(NUM_BLOCKS * BLOCK_LEN, -1)
-            diff = (ek[:live_now].float() - rk[:live_now].float()).abs().amax(dim=-1)
-            bad = int((diff > 1e-2).sum())
-
-            if bad and "bad_step" not in snapshot:
-                snapshot["bad_step"] = engine._stats.steps
-                print(
-                    f"first cache corruption at step {engine._stats.steps}: "
-                    f"{bad} bad slots in [0, {live_now}), worst {float(diff.max()):.3f}",
-                    flush=True,
-                )
+            if invalid and "diagnosed" not in snapshot:
+                snapshot["diagnosed"] = True
                 diagnose_row(
                     snapshot, reference, ref_helper, ref_track,
                     prompt_ids, generated,
                 )
-                break
 
             for token in committed:
                 validate(token, len(generated))

@@ -50,22 +50,40 @@ class TreeSpec:
     Nodes are stored in append (scratch) order. ``parents[j] == -1`` marks a
     root child (its parent is the pending token). The pending token itself is
     NOT a node — it is re-processed at the head of every forward.
+
+    Each node carries ``node_masks[j]``: a uint64-style visibility bitmask,
+    bit 0 = the pending token, bits 1..T = tree nodes (bit j+1 = node j).
+    ``append`` maintains it in O(1) — ``mask_child = mask_parent | 1 << (j+1)``
+    — so the optimized tree-mask builder is a pure unpack of these words: a
+    node's full tree visibility (pending + ancestors + self, never siblings)
+    is one integer. Budgets above 63 nodes are rejected at engine
+    construction to keep the int64 tensor conversion sign-safe.
     """
+
+    PENDING_BIT = 1
 
     num_history: int
     parents: list[int] = field(default_factory=list)
     tokens: list[int] = field(default_factory=list)
     depths: list[int] = field(default_factory=list)
     node_log_confs: list[float] = field(default_factory=list)
+    node_masks: list[int] = field(default_factory=list)
 
     def append(self, parent: int | None, token: int, log_conf: float) -> int:
         depth = 1 if parent is None else self.depths[parent] + 1
+        j = len(self.tokens)
+
+        if parent is None:
+            mask = self.PENDING_BIT | (1 << (j + 1))
+        else:
+            mask = self.node_masks[parent] | (1 << (j + 1))
 
         self.parents.append(-1 if parent is None else parent)
         self.tokens.append(token)
         self.depths.append(depth)
         self.node_log_confs.append(log_conf)
-        return len(self.tokens) - 1
+        self.node_masks.append(mask)
+        return j
 
     def children(self, j: int | None) -> list[int]:
         if j is None:
@@ -240,6 +258,11 @@ class TreeSpeculativeEngine(SpeculativeEngine):
             num_blocks=num_blocks,
             num_spec_tokens=1,
         )
+        if tree_budget > 63:
+            raise ValueError(
+                "tree_budget must be <= 63: node visibility bitmasks pack "
+                "the pending token plus every node into one int64 word"
+            )
         if tree_budget < 1:
             raise ValueError("tree_budget must be >= 1")
         if branch_factor < 1:

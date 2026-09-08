@@ -57,6 +57,40 @@ def test_tree_spec_structure():
     assert [spec.rope_pos(j) for j in range(4)] == [11, 11, 12, 12]
 
 
+def test_node_masks_match_ancestor_walk():
+    """The O(1) append-time bitmask must agree with the parent-chain walk:
+    bit 0 = pending, bit j+1 = node j; a node's word is exactly pending +
+    ancestors + self."""
+    spec = _tree_spec()
+    # node 3's parent is node 0: word = pending | node0 | node3
+    assert spec.node_masks[3] == (1 << 0) | (1 << 1) | (1 << 4)
+    # root children: pending | self
+    assert spec.node_masks[0] == (1 << 0) | (1 << 1)
+    assert spec.node_masks[1] == (1 << 0) | (1 << 2)
+
+    for j in range(len(spec.tokens)):
+        expected = 1  # pending bit
+
+        for a in spec.ancestors(j):
+            expected |= 1 << (a + 1)
+
+        expected |= 1 << (j + 1)
+        assert spec.node_masks[j] == expected
+
+
+def test_tree_budget_cap():
+    runner = DeterministicModelRunner(vocab_size=VOCAB)
+
+    try:
+        TreeSpeculativeEngine(
+            runner, runner, device=torch.device("cpu"), tree_budget=64
+        )
+    except ValueError as exc:
+        assert "63" in str(exc)
+    else:
+        raise AssertionError("tree_budget 64 must be rejected (int64 sign bit)")
+
+
 def test_reference_mask_invariants():
     spec = _tree_spec()
     mask = build_tree_mask_reference(spec)

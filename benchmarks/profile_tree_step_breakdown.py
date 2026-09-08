@@ -147,10 +147,16 @@ def main() -> None:
     parser.add_argument("--mode", choices=["wall", "sync"], default="sync")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--profiler", action="store_true")
+    parser.add_argument("--w4a16-draft", action="store_true")
     args = parser.parse_args()
 
     target = build(args.target_dir / "config.json", args.target_dir, w4a16=True, custom_ops=True)
-    draft = build(args.draft_dir / "config.json", args.draft_dir, w4a16=False, custom_ops=True)
+    draft = build(
+        args.draft_dir / "config.json",
+        args.draft_dir,
+        w4a16=args.w4a16_draft,
+        custom_ops=True,
+    )
 
     from transformers import AutoTokenizer
 

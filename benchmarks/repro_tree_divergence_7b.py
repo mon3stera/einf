@@ -378,7 +378,7 @@ def main() -> None:
         while len(generated) < max_new and not invalid:
             snapshot["pending"] = engine._target.pending_token
             snapshot["live"] = engine._target.context_len
-            committed = engine.step(greedy=True)
+            committed = engine.step(greedy=engine_kind == "tree")
             snapshot.update(spec=engine._last_tree[0], logits=engine._last_tree[2])
             snapshot["engine_cache"] = engine._target.runner.cache
             generated.extend(committed)

@@ -14,9 +14,9 @@ import torch
 
 import flashinfer
 
-sys.path.insert(0, "tests")
+sys.path.insert(0, "src")
 
-from test_speculative_tree_gpu import pack_mask_flashinfer  # noqa: E402
+from einf.executors.torch.spec_tree import pack_mask_flashinfer
 
 DEVICE = torch.device("cuda")
 

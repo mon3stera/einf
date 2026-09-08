@@ -304,8 +304,20 @@ def main() -> None:
     orig_gather = spec_tree_mod.gather_commit_kv
 
     def logged_gather(storage, src_slots, dst_slots):
-        print(f"  gather src={src_slots} dst={dst_slots}", flush=True)
-        return orig_gather(storage, src_slots, dst_slots)
+        flat = storage.K[0].reshape(-1, storage.K.shape[-2] * storage.K.shape[-1])
+        before = [float(flat[s].abs().sum()) for s in [15, 16, 17]]
+        print(
+            f"  gather src={src_slots} dst={dst_slots} "
+            f"K[0] slots 15/16/17 |sum| before {before}",
+            flush=True,
+        )
+        out = orig_gather(storage, src_slots, dst_slots)
+        after = [float(flat[s].abs().sum()) for s in [15, 16, 17]]
+        print(
+            f"  gather done: K[0] slots 15/16/17 |sum| after {after}",
+            flush=True,
+        )
+        return out
 
     spec_tree_mod.gather_commit_kv = logged_gather
 

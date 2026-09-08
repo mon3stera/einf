@@ -26,11 +26,9 @@ Confidence (EAGLE-2 style): ``log_conf(child) = log_conf(parent) +
 log_softmax(logits_parent)[child]`` — full-vocabulary probabilities, never
 renormalized across siblings.
 
-Skeleton scope: this module is CPU-complete (expansion, mask reference,
-greedy path finding, gather commit, bookkeeping). GPU-only wiring is
-explicitly deferred and marked TODO: FlashInfer ``packed_custom_mask``
-planning (the phase-0 probe validated the kernel API) and per-level masks
-for the expansion forwards.
+The verify and expansion forwards build their masks with the vectorized
+builders and hand FlashInfer ``packed_custom_mask`` through
+``ModelInput.packed_mask`` (the phase-0 probe validated the kernel API).
 """
 
 from __future__ import annotations
@@ -220,6 +218,29 @@ def pack_mask_flashinfer(mask: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(bits)
 
 
+def build_level_mask(spec: TreeSpec, level: list[int]) -> torch.Tensor:
+    """Visibility mask for one level-wise draft expansion forward.
+
+    ``level`` lists nodes that were appended by earlier levels and are being
+    forwarded now (their KV slots are filled by this forward's
+    write-before-attention). Row ``i`` must see history, the pending token,
+    node ``level[i]``'s ancestors, and itself — exactly ``node_masks[j]`` —
+    and never its siblings or any other branch (their slots are dead scratch).
+    The node block covers every appended node so far, so a node's own bit
+    ``j + 1`` and all ancestor bits fall inside it.
+    """
+    t = len(spec.tokens)
+    total_kv = spec.num_history + 1 + t
+    mask = torch.zeros((len(level), total_kv), dtype=torch.bool)
+
+    mask[:, : spec.num_history + 1] = True
+
+    bits = torch.tensor([spec.node_masks[j] for j in level], dtype=torch.int64)
+    cols = torch.arange(1, t + 1)
+    mask[:, spec.num_history + 1 :] = ((bits.unsqueeze(-1) >> cols) & 1).bool()
+    return mask
+
+
 def find_greedy_path(
     logits: torch.Tensor, spec: TreeSpec
 ) -> tuple[list[int], list[int]]:
@@ -355,6 +376,9 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         n = len(token_ids)
         device = self._device
 
+        if packed_mask is not None and packed_mask.device != device:
+            packed_mask = packed_mask.to(device)
+
         return ModelInput(
             input_token_ids=torch.tensor(token_ids, dtype=torch.long, device=device),
             position=torch.tensor(positions, dtype=torch.long, device=device),
@@ -429,16 +453,14 @@ class TreeSpeculativeEngine(SpeculativeEngine):
                 positions = [spec.rope_pos(j) for j in level]
                 slots = [spec.logical_pos(j) for j in level]
                 context = live + 1 + len(spec.tokens)
+                level_mask = build_level_mask(spec, level)
                 model_input = self._make_tree_input(
                     draft,
                     tokens,
                     positions,
                     slots,
                     context_len=context,
-                    # TODO(3b-GPU): per-level ancestor masks for the real
-                    # attention path; the deterministic CPU runner ignores
-                    # attention entirely.
-                    packed_mask=None,
+                    packed_mask=pack_mask_flashinfer(level_mask),
                 )
                 out = draft.forward(model_input)
                 parents = level
@@ -520,7 +542,7 @@ class TreeSpeculativeEngine(SpeculativeEngine):
         verify_tokens = [target.pending_token, *spec.tokens]
         verify_positions = [live] + [spec.rope_pos(j) for j in range(len(spec.tokens))]
         verify_slots = [live] + [spec.logical_pos(j) for j in range(len(spec.tokens))]
-        mask = build_tree_mask_reference(spec)
+        packed_mask = pack_mask_flashinfer(build_tree_mask(spec))
         out = target.forward(
             self._make_tree_input(
                 target,
@@ -528,9 +550,7 @@ class TreeSpeculativeEngine(SpeculativeEngine):
                 verify_positions,
                 verify_slots,
                 context_len=spec.total_kv,
-                # TODO(3b-GPU): pack and hand to FlashInfer plan(); the
-                # deterministic CPU runner ignores it.
-                packed_mask=mask,
+                packed_mask=packed_mask,
             )
         )
         logits = out.logits.detach().float()

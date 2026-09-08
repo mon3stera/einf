@@ -162,6 +162,37 @@ class FlashInferPagedAttention:
         )
         if plan is None:
             raise RuntimeError("FlashInfer wrapper has neither plan nor begin_forward")
+
+        # A packed custom mask replaces the causal assumption entirely (the
+        # phase-0 probe validated the packed bit convention): tree speculation
+        # rows skip siblings, which causal cannot express. The mask covers
+        # qo_len x kv_len bits, where kv_len counts TOKENS (context includes
+        # the qo rows themselves — the cache is written before attention).
+        plan_kwargs: dict[str, object] = {
+            "causal": True,
+            "sm_scale": self.sm_scale,
+            "q_data_type": self.dtype,
+            "kv_data_type": self.kv_dtype,
+        }
+
+        packed_mask = model_input.packed_mask
+
+        if packed_mask is not None:
+            if packed_mask.device != qo_indptr.device:
+                raise ValueError("packed_mask must live on the plan device")
+            qo_total = int(model_input.query_start_loc[-1])
+            kv_total = int(model_input.context_lens.sum())
+            expected_bits = qo_total * kv_total
+
+            if packed_mask.numel() * 8 < expected_bits:
+                raise ValueError(
+                    f"packed_mask covers {packed_mask.numel() * 8} bits but "
+                    f"the forward needs {expected_bits} "
+                    f"(qo={qo_total} x kv={kv_total})"
+                )
+            plan_kwargs["causal"] = False
+            plan_kwargs["packed_custom_mask"] = packed_mask
+
         plan(
             qo_indptr,
             page_indptr,
@@ -171,10 +202,7 @@ class FlashInferPagedAttention:
             self.num_kv_heads,
             self.head_dim,
             self.page_size,
-            causal=True,
-            sm_scale=self.sm_scale,
-            q_data_type=self.dtype,
-            kv_data_type=self.kv_dtype,
+            **plan_kwargs,
         )
 
     def ensure_decode_wrapper(self, bucket: int) -> object:

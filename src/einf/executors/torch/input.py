@@ -48,10 +48,11 @@ class ModelInput:
     # the speculative engine) may set it.
     is_decode_only: bool = False
     # Packed custom mask for tree speculation (spec_tree.pack_mask_flashinfer):
-    # a bit-per-entry ``[total_q, context + total_q]`` visibility matrix that
-    # replaces the causal assumption for this forward. ``None`` keeps the
-    # standard causal path. The FlashInfer plan() wiring is deferred to the
-    # GPU milestone of tree speculation.
+    # bit-per-entry little-endian packing of the ``[total_q, context + total_q]``
+    # visibility matrix, consumed by FlashInfer plan() as
+    # ``packed_custom_mask`` (which replaces the causal assumption). ``None``
+    # keeps the standard causal path; the in-house attention kernels reject
+    # it because their causal/prefix contracts cannot express tree masks.
     packed_mask: Tensor | None = None
 
     @classmethod

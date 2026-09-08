@@ -275,6 +275,12 @@ class QwenAttention(nn.Module):
             with record_function("attn.o_proj"):
                 return self.o_proj(output.reshape(packed_len, -1))
 
+        if self.flashinfer is None and model_input.packed_mask is not None:
+            raise ValueError(
+                "custom attention masks (tree speculation) require the "
+                "FlashInfer attention backend"
+            )
+
         request_outputs = []
         for request_idx in range(len(model_input.query_start_loc_host) - 1):
             query_start = model_input.query_start_loc_host[request_idx]

@@ -1,0 +1,165 @@
+"""GPU smoke test: tree speculative engine on tiny random-weight Qwen runners.
+
+The tree engine's masked verify forward (FlashInfer ``packed_custom_mask``
+through ``ModelInput.packed_mask``), level-wise draft expansion masks, and
+gather commit are exercised end-to-end. Greedy tree speculation is
+lossless: whatever the draft proposes, the committed sequence must equal a
+plain greedy decode loop over the target weights token-for-token (near-tie
+numerics aside — the chain GPU test documents why).
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from einf.cache.storage import KVCacheGeometry, TorchKVCacheStorage
+from einf.executors.torch.qwen import QwenConfig, QwenModelRunner
+from einf.executors.torch.spec_runner import SpeculativeEngine, _Track
+from einf.executors.torch.spec_tree import TreeSpeculativeEngine
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"
+)
+
+BLOCK_LEN = 8
+NUM_BLOCKS = 32
+MAX_NEW = 24
+
+
+def _tiny_runner(device: torch.device, seed: int) -> QwenModelRunner:
+    config = QwenConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_theta=10000.0,
+        max_position_embeddings=512,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    cache = TorchKVCacheStorage(
+        KVCacheGeometry(
+            num_layers=config.num_hidden_layers,
+            num_blocks=NUM_BLOCKS,
+            block_len=BLOCK_LEN,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+        ),
+        dtype=torch.float32,
+        device=device,
+        use_custom_ops=False,
+    )
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    torch.manual_seed(seed)
+    try:
+        with torch.device(device):
+            runner = QwenModelRunner(
+                config,
+                cache=cache,
+                use_flashinfer_attention=True,
+            )
+    finally:
+        torch.set_default_dtype(previous)
+    return runner.eval()
+
+
+def _plain_greedy(
+    runner: QwenModelRunner, device: torch.device, prompt: list[int]
+) -> tuple[list[int], list[float]]:
+    """Sequential greedy decode loop over the same weights (the oracle)."""
+    track = _Track(
+        forward=runner.forward,
+        runner=runner,
+        block_table=list(range(NUM_BLOCKS)),
+        context_len=0,
+        pending_token=-1,
+    )
+    helper = SpeculativeEngine(
+        runner, runner, device=device, block_len=BLOCK_LEN, num_blocks=NUM_BLOCKS
+    )
+    gaps: list[float] = []
+    with torch.inference_mode():
+        out = runner.forward(helper._make_input(track, list(prompt)))
+        token = int(out.logits[-1].argmax().item())
+        ids = [token]
+        gaps.append(_top2_gap(out.logits[-1]))
+        track.context_len = len(prompt)
+
+        while len(ids) < MAX_NEW:
+            out = runner.forward(helper._make_input(track, [token]))
+            token = int(out.logits[-1].argmax().item())
+            gaps.append(_top2_gap(out.logits[-1]))
+            track.context_len += 1
+            ids.append(token)
+    return ids, gaps
+
+
+def _top2_gap(logits: torch.Tensor) -> float:
+    top2 = torch.topk(logits.float(), 2).values
+    return float(top2[0] - top2[1])
+
+
+@requires_cuda
+def test_tree_engine_flashinfer_matches_plain_loop():
+    device = torch.device("cuda")
+    target = _tiny_runner(device, seed=7)
+    draft = _tiny_runner(device, seed=11)
+
+    engine = TreeSpeculativeEngine(
+        target,
+        draft,
+        device=device,
+        block_len=BLOCK_LEN,
+        num_blocks=NUM_BLOCKS,
+        tree_budget=8,
+        branch_factor=2,
+        max_depth=3,
+    )
+    tree_ids, stats = engine.generate([11, 5, 23], max_new_len=MAX_NEW, greedy=True)
+
+    plain_ids, plain_gaps = _plain_greedy(target, device, [11, 5, 23])
+
+    # losslessness: divergences only at near-tie positions (the same
+    # numerics caveat as the chain GPU test)
+    diverged = [i for i, (a, b) in enumerate(zip(tree_ids, plain_ids)) if a != b]
+    for i in diverged:
+        assert plain_gaps[i] < 1e-3, (
+            f"divergence at {i} with well-separated logits "
+            f"(gap={plain_gaps[i]:.3e})"
+        )
+    assert len(diverged) <= 2
+
+    # the mismatched draft must produce real tree traffic: proposals happen
+    # and some are accepted (guards against a silently empty tree)
+    assert stats.proposed > 0
+    assert stats.accepted > 0
+
+
+@requires_cuda
+def test_tree_engine_self_drafting_accepts_everything():
+    """Self-speculation: identical weights accept every proposal under
+    greedy decoding, so accepted must equal proposed across the run."""
+    device = torch.device("cuda")
+    runner = _tiny_runner(device, seed=7)
+
+    engine = TreeSpeculativeEngine(
+        runner,
+        runner,
+        device=device,
+        block_len=BLOCK_LEN,
+        num_blocks=NUM_BLOCKS,
+        tree_budget=6,
+        branch_factor=2,
+        max_depth=2,
+    )
+    _, stats = engine.generate([11, 5, 23], max_new_len=MAX_NEW, greedy=True)
+
+    assert stats.proposed > 0
+    assert stats.accepted == stats.proposed

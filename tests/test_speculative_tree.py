@@ -322,6 +322,38 @@ def test_build_tree_mask_matches_reference_random_trees():
         assert torch.equal(build_tree_mask(spec), build_tree_mask_reference(spec))
 
 
+def test_build_level_mask_excludes_siblings():
+    """A level-expansion row sees pending + ancestors + itself, never
+    siblings or other branches."""
+    import numpy as np
+
+    from einf.executors.torch.spec_tree import build_level_mask
+
+    spec = TreeSpec(num_history=5)
+    spec.append(None, 10, -0.1)  # node 0
+    spec.append(None, 11, -0.2)  # node 1
+    spec.append(0, 12, -0.4)  # node 2, child of node 0
+
+    # forwarding nodes 1 and 2 (t = 3 appended nodes, kv width 5 hist + 1 + 3)
+    mask = build_level_mask(spec, [1, 2])
+    assert mask.shape == (2, 9)
+
+    assert mask[:, :6].all()  # history + pending visible to both rows
+
+    # node 1: sees itself only among nodes (node 0 is its sibling, node 2
+    # is node 0's child — both invisible)
+    assert mask[0].tolist() == [True] * 6 + [False, True, False]
+    # node 2: sees parent (node 0) and itself, not node 1
+    assert mask[1].tolist() == [True] * 6 + [True, False, True]
+
+    # packed form round-trips
+    packed = pack_mask_flashinfer(mask)
+    unpacked = np.unpackbits(packed.numpy(), bitorder="little")[: mask.numel()]
+    assert torch.equal(
+        torch.from_numpy(unpacked.reshape(mask.shape).copy()), mask
+    )
+
+
 def test_tree_engine_sampling_one_hot_matches_greedy():
     """One-hot logits make multinomial degenerate to argmax, so the NS
     sampling walk must reproduce the greedy closed form exactly."""

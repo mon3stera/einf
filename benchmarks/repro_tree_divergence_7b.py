@@ -92,6 +92,83 @@ def plain_greedy(runner: QwenModelRunner, prompt_ids: list[int], max_new_len: in
     return ids, gaps
 
 
+def diagnose_row(
+    snapshot: dict,
+    reference: QwenModelRunner,
+    ref_helper: SpeculativeEngine,
+    ref_track: _Track,
+    prompt_ids: list[int],
+    generated: list[int],
+) -> None:
+    """Recompute every verify row of the failing step with an independent
+    runner (causal forward over exactly the row's visible token set, RoPE
+    by depth) and compare argmaxes against the engine's verify logits."""
+    from einf.executors.torch.input import ModelInput
+
+    spec = snapshot["spec"]
+    logits = snapshot["logits"]
+    live = snapshot["live"]
+    pending = snapshot["pending"]
+    history = prompt_ids + generated[: live - len(prompt_ids)]
+    t = len(spec.tokens)
+    mismatches = 0
+
+    for r in range(spec.total_q):
+        if r == 0:
+            visible_nodes: list[int] = []
+            row_pending = True
+        else:
+            j = r - 1
+            word = spec.node_masks[j]
+            visible_nodes = [k for k in range(t) if (word >> (k + 1)) & 1]
+            row_pending = bool(word & 1)
+
+        tokens = list(history)
+        positions = list(range(live))
+
+        if row_pending:
+            tokens.append(pending)
+            positions.append(live)
+
+        for k in visible_nodes:
+            tokens.append(spec.tokens[k])
+            positions.append(spec.rope_pos(k))
+
+        tokens.append(spec.tokens[r - 1] if r > 0 else pending)
+        positions.append(spec.rope_pos(r - 1) if r > 0 else live)
+
+        base = 2000
+        model_input = ModelInput(
+            input_token_ids=torch.tensor(tokens, dtype=torch.long, device=DEVICE),
+            position=torch.tensor(positions, dtype=torch.long, device=DEVICE),
+            slot_mapping=torch.tensor(
+                [base + i for i in range(len(tokens))], dtype=torch.long, device=DEVICE
+            ),
+            query_start_loc=torch.tensor([0, len(tokens)], dtype=torch.long, device=DEVICE),
+            block_tables=torch.arange(NUM_BLOCKS, dtype=torch.long, device=DEVICE).unsqueeze(0),
+            context_lens=torch.tensor([len(tokens)], dtype=torch.long, device=DEVICE),
+            query_start_loc_host=(0, len(tokens)),
+            context_lens_host=(len(tokens),),
+        )
+        out = reference.forward(model_input)
+        ref_argmax = int(out.logits[-1].argmax().item())
+        engine_argmax = int(logits[r].argmax().item())
+        top_ref = torch.topk(out.logits[-1].float(), 2)
+        ok = engine_argmax == ref_argmax
+        deficit = float(top_ref.values[0] - out.logits[-1].float()[engine_argmax])
+        mark = "ok" if ok else f"MISMATCH deficit={deficit:.3f}"
+        if not ok:
+            mismatches += 1
+        print(
+            f"row {r:2d} ({'pending' if r == 0 else f'node {r - 1}'}): "
+            f"visible={len(tokens)} engine_argmax={engine_argmax} "
+            f"ref_argmax={ref_argmax} {mark}",
+            flush=True,
+        )
+
+    print(f"rows mismatched: {mismatches}/{spec.total_q}", flush=True)
+
+
 def main() -> None:
     args = [a for a in sys.argv[1:]]
     w4a16 = "--bf16" not in args
@@ -149,6 +226,8 @@ def main() -> None:
     invalid: list[tuple[int, int, float]] = []
     generated: list[int] = []
     ref_state = {"logits": None}
+    # per-step snapshot for row-level diagnosis of the first invalid token
+    snapshot: dict = {}
 
     def validate(token: int, output_index: int) -> None:
         logits = ref_state["logits"]
@@ -172,12 +251,18 @@ def main() -> None:
         validate(first, len(generated))
         generated.append(first)
 
-        while len(generated) < max_new:
+        while len(generated) < max_new and not invalid:
+            snapshot["pending"] = engine._target.pending_token
+            snapshot["live"] = engine._target.context_len
             committed = engine.step(greedy=True)
+            snapshot.update(spec=engine._last_tree[0], logits=engine._last_tree[2])
 
             for token in committed:
                 validate(token, len(generated))
                 generated.append(token)
+
+    if invalid:
+        diagnose_row(snapshot, reference, ref_helper, ref_track, prompt_ids, generated)
 
     if not invalid:
         print(

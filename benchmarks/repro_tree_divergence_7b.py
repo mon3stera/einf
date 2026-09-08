@@ -169,7 +169,14 @@ def main() -> None:
         ref_state["logits"] = out.logits[-1]
 
         while len(generated) < max_new:
+            print(
+                f"step {engine._stats.steps}: pending(draft={engine._draft.pending_token}, "
+                f"target={engine._target.pending_token}) "
+                f"ctx(draft={engine._draft.context_len}, target={engine._target.context_len})",
+                flush=True,
+            )
             committed = engine.step(greedy=True)
+            print(f"  committed {committed}", flush=True)
 
             for token in committed:
                 validate(token, len(generated))

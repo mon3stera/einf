@@ -145,31 +145,33 @@ def diagnose_row(
     pending = snapshot["pending"]
     history = prompt_ids + generated[: live - len(prompt_ids)]
     t = len(spec.tokens)
-    mismatches = 0
+    diagnose_row.mismatches = 0
 
     for r in range(spec.total_q):
         if r == 0:
-            visible_nodes: list[int] = []
-            row_pending = True
-        else:
-            j = r - 1
-            word = spec.node_masks[j]
-            visible_nodes = [k for k in range(t) if (word >> (k + 1)) & 1]
-            row_pending = bool(word & 1)
+            # pending row: history + pending only
+            tokens = list(history) + [pending]
+            positions = list(range(live)) + [live]
+            _emit_row(tokens, positions, reference)
+            _compare(r, logits, reference, "pending")
+            continue
 
-        tokens = list(history)
-        positions = list(range(live))
-
-        if row_pending:
-            tokens.append(pending)
-            positions.append(live)
+        j = r - 1
+        word = spec.node_masks[j]
+        visible_nodes = [
+            k for k in range(t) if k != j and (word >> (k + 1)) & 1
+        ]
+        tokens = list(history) + [pending]
+        positions = list(range(live)) + [live]
 
         for k in visible_nodes:
             tokens.append(spec.tokens[k])
             positions.append(spec.rope_pos(k))
 
-        tokens.append(spec.tokens[r - 1] if r > 0 else pending)
-        positions.append(spec.rope_pos(r - 1) if r > 0 else live)
+        tokens.append(spec.tokens[j])
+        positions.append(spec.rope_pos(j))
+        _emit_row(tokens, positions, reference)
+        _compare(r, logits, reference, f"node {j}")
 
         base = 2000
         model_input = ModelInput(
@@ -184,23 +186,50 @@ def diagnose_row(
             query_start_loc_host=(0, len(tokens)),
             context_lens_host=(len(tokens),),
         )
-        out = reference.forward(model_input)
-        ref_argmax = int(out.logits[-1].argmax().item())
-        engine_argmax = int(logits[r].argmax().item())
-        top_ref = torch.topk(out.logits[-1].float(), 2)
-        ok = engine_argmax == ref_argmax
-        deficit = float(top_ref.values[0] - out.logits[-1].float()[engine_argmax])
-        mark = "ok" if ok else f"MISMATCH deficit={deficit:.3f}"
-        if not ok:
-            mismatches += 1
-        print(
-            f"row {r:2d} ({'pending' if r == 0 else f'node {r - 1}'}): "
-            f"visible={len(tokens)} engine_argmax={engine_argmax} "
-            f"ref_argmax={ref_argmax} {mark}",
-            flush=True,
-        )
+    print(f"rows mismatched: {diagnose_row.mismatches}/{spec.total_q}", flush=True)
 
-    print(f"rows mismatched: {mismatches}/{spec.total_q}", flush=True)
+
+def _emit_row(tokens: list[int], positions: list[int], reference: QwenModelRunner) -> None:
+    from einf.executors.torch.input import ModelInput
+
+    base = 2000
+    model_input = ModelInput(
+        input_token_ids=torch.tensor(tokens, dtype=torch.long, device=DEVICE),
+        position=torch.tensor(positions, dtype=torch.long, device=DEVICE),
+        slot_mapping=torch.tensor(
+            [base + i for i in range(len(tokens))], dtype=torch.long, device=DEVICE
+        ),
+        query_start_loc=torch.tensor([0, len(tokens)], dtype=torch.long, device=DEVICE),
+        block_tables=torch.arange(NUM_BLOCKS, dtype=torch.long, device=DEVICE).unsqueeze(0),
+        context_lens=torch.tensor([len(tokens)], dtype=torch.long, device=DEVICE),
+        query_start_loc_host=(0, len(tokens)),
+        context_lens_host=(len(tokens),),
+    )
+    diagnose_row.last_logits = reference.forward(model_input).logits[-1]
+
+
+def _compare(
+    r: int,
+    logits,
+    reference: QwenModelRunner,
+    label: str,
+) -> None:
+    ref_logits = diagnose_row.last_logits
+    engine_argmax = int(logits[r].argmax().item())
+    ref_argmax = int(ref_logits.argmax().item())
+    top_ref = torch.topk(ref_logits.float(), 2)
+    ok = engine_argmax == ref_argmax
+    deficit = float(top_ref.values[0] - ref_logits.float()[engine_argmax])
+    mark = "ok" if ok else f"MISMATCH deficit={deficit:.3f}"
+
+    if not ok:
+        diagnose_row.mismatches += 1
+
+    print(
+        f"row {r:2d} ({label}): engine_argmax={engine_argmax} "
+        f"ref_argmax={ref_argmax} {mark}",
+        flush=True,
+    )
 
 
 def main() -> None:

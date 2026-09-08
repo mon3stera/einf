@@ -26,7 +26,7 @@ def manual_attention(
 ) -> torch.Tensor:
     """q: [qo, H, D], k/v: [kv, KVH, D], mask: [qo, kv] bool -> [qo, H, D]."""
     qo, heads, dim = q.shape
-    kvh = k.shape[2]
+    kvh = k.shape[1]
     group = heads // kvh
     qg = q.view(qo, group, kvh, dim)  # head h -> kv head h // group
     scores = torch.einsum(

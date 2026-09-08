@@ -28,7 +28,7 @@ def manual_attention(
     qo, heads, dim = q.shape
     kvh = k.shape[1]
     group = heads // kvh
-    qg = q.view(qo, group, kvh, dim)  # head h -> kv head h // group
+    qg = q.view(qo, kvh, group, dim)  # head h -> kv head h // group
     scores = torch.einsum("qghd,khd->qghk", qg.float(), k.float()) * sm_scale
     scores = scores.masked_fill(~mask.view(qo, 1, 1, -1), float("-inf"))
     probs = torch.softmax(scores, dim=-1)

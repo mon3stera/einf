@@ -48,11 +48,25 @@ def main() -> None:
     kv_cache = torch.randn(1, 2, page * 4, kvh, dim, dtype=torch.bfloat16, device=DEVICE)
 
     workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
 
     pages_max = (kv_max + page - 1) // page
     mask_buf = torch.zeros(
         qo * kv_max // 8 + 1, dtype=torch.uint8, device=DEVICE
+    )
+
+    # FlashInfer's CUDA-graph mode: persistent buffers the captured kernels
+    # read at replay time, so plan() can stay outside the graph and replays
+    # need no re-planning.
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace,
+        "NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.zeros(2, dtype=torch.int32, device=DEVICE),
+        paged_kv_indptr_buf=torch.zeros(2, dtype=torch.int32, device=DEVICE),
+        paged_kv_indices_buf=torch.zeros(8, dtype=torch.int32, device=DEVICE),
+        paged_kv_last_page_len_buf=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        custom_mask_buf=mask_buf,
+        mask_indptr_buf=torch.zeros(2, dtype=torch.int32, device=DEVICE),
     )
 
     def plan_and_fill(kv: int) -> None:

@@ -57,7 +57,9 @@ def instrument(engine, state: dict) -> None:
                 if sync:
                     torch.cuda.synchronize()
 
-                state["ms"][name] += (time.perf_counter() - start) * 1e3
+                state["ms"][name] = (
+                    state["ms"].get(name, 0.0) + (time.perf_counter() - start) * 1e3
+                )
 
         return wrapper
 
@@ -122,7 +124,9 @@ def instrument(engine, state: dict) -> None:
             if sync:
                 torch.cuda.synchronize()
 
-            state["ms"]["step_total"] += (time.perf_counter() - start) * 1e3
+            state["ms"]["step_total"] = (
+                state["ms"].get("step_total", 0.0) + (time.perf_counter() - start) * 1e3
+            )
 
     engine.step = stepped
 

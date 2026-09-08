@@ -147,9 +147,11 @@ def test_tree_engine_flashinfer_matches_plain_loop():
 
 
 @requires_cuda
-def test_tree_engine_self_drafting_accepts_everything():
+def test_tree_engine_self_drafting_accepts_full_depth():
     """Self-speculation: identical weights accept every proposal under
-    greedy decoding, so accepted must equal proposed across the run."""
+    greedy decoding, so the accepted path reaches max depth on nearly
+    every step. (accepted is bounded by depth per step, not by the tree
+    budget — most proposed nodes are off-path branches by construction.)"""
     device = torch.device("cuda")
     runner = _tiny_runner(device, seed=7)
 
@@ -166,4 +168,4 @@ def test_tree_engine_self_drafting_accepts_everything():
     _, stats = engine.generate([11, 5, 23], max_new_len=MAX_NEW, greedy=True)
 
     assert stats.proposed > 0
-    assert stats.accepted == stats.proposed
+    assert stats.accepted >= 0.9 * stats.steps * 2

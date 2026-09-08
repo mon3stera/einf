@@ -243,6 +243,28 @@ def main() -> None:
         max_depth=depth,
     )
 
+    import einf.executors.torch.spec_tree as spec_tree_mod
+
+    orig_gather = spec_tree_mod.gather_commit_kv
+
+    def logged_gather(storage, src_slots, dst_slots):
+        print(f"  gather src={src_slots} dst={dst_slots}", flush=True)
+        return orig_gather(storage, src_slots, dst_slots)
+
+    spec_tree_mod.gather_commit_kv = logged_gather
+
+    orig_path = spec_tree_mod.find_greedy_path
+
+    def logged_path(logits, spec):
+        path, committed = orig_path(logits, spec)
+        print(
+            f"  walk path={path} committed={committed} live={spec.num_history}",
+            flush=True,
+        )
+        return path, committed
+
+    spec_tree_mod.find_greedy_path = logged_path
+
     # reference decode state: validate each committed token as the argmax
     # (within tie tolerance) of the reference at the evolving context
     ref_track = _Track(
@@ -285,7 +307,7 @@ def main() -> None:
         validate(first, len(generated))
         generated.append(first)
 
-        while len(generated) < max_new and not invalid:
+        while len(generated) < max_new and len(invalid) < 1:
             snapshot["pending"] = engine._target.pending_token
             snapshot["live"] = engine._target.context_len
             committed = engine.step(greedy=True)

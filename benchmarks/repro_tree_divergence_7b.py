@@ -264,12 +264,12 @@ def main() -> None:
     w4a16 = "--bf16" not in args
     custom_ops = "--no-custom-ops" not in args
 
-    tol = 1e-2
+    TOL = 1e-2
     engine_kind = "tree"
 
     if "--tol" in args:
         i = args.index("--tol")
-        tol = float(args[i + 1])
+        TOL = float(args[i + 1])
         args = args[:i] + args[i + 2 :]
 
     if "--engine" in args:
@@ -291,9 +291,6 @@ def main() -> None:
     )
     target = build(target_dir / "config.json", target_dir, w4a16=w4a16, custom_ops=custom_ops)
     draft = build(draft_dir / "config.json", draft_dir, w4a16=False, custom_ops=custom_ops)
-    # independent reference runner: validates the engine's output as a valid
-    # greedy trajectory, immune to tie-flip trajectory cascades
-    reference = build(target_dir / "config.json", target_dir, w4a16=w4a16, custom_ops=custom_ops)
 
     from transformers import AutoTokenizer
 
@@ -302,131 +299,89 @@ def main() -> None:
         "The capital of France is Paris. The city is famous for"
     )
 
-    engine = TreeSpeculativeEngine(
-        target,
-        draft,
-        device=DEVICE,
-        block_len=BLOCK_LEN,
-        num_blocks=NUM_BLOCKS,
-        tree_budget=budget,
-        branch_factor=branch,
-        max_depth=depth,
+    if engine_kind == "tree":
+        engine = TreeSpeculativeEngine(
+            target,
+            draft,
+            device=DEVICE,
+            block_len=BLOCK_LEN,
+            num_blocks=NUM_BLOCKS,
+            tree_budget=budget,
+            branch_factor=branch,
+            max_depth=depth,
+        )
+    else:
+        engine = SpeculativeEngine(
+            target,
+            draft,
+            device=DEVICE,
+            block_len=BLOCK_LEN,
+            num_blocks=NUM_BLOCKS,
+            num_spec_tokens=budget,
+        )
+
+    generated: list[int] = []
+
+    with torch.inference_mode():
+        first = engine.prefill(prompt_ids, greedy=True)
+        generated.append(first)
+
+        while len(generated) < max_new:
+            generated.extend(engine.step(greedy=engine_kind == "tree"))
+
+    generated = generated[:max_new]
+    print(
+        f"engine done: {len(generated)} tokens, steps={engine._stats.steps} "
+        f"acc/step={engine._stats.accepted / max(engine._stats.steps, 1):.2f}",
+        flush=True,
     )
 
-    import einf.executors.torch.spec_tree as spec_tree_mod
-
-    orig_gather = spec_tree_mod.gather_commit_kv
-
-    def logged_gather(storage, src_slots, dst_slots):
-        flat = storage.K[0].reshape(-1, storage.K.shape[-2] * storage.K.shape[-1])
-        before = [float(flat[s].abs().sum()) for s in [15, 16, 17]]
-        print(
-            f"  gather src={src_slots} dst={dst_slots} "
-            f"K[0] slots 15/16/17 |sum| before {before}",
-            flush=True,
-        )
-        out = orig_gather(storage, src_slots, dst_slots)
-        after = [float(flat[s].abs().sum()) for s in [15, 16, 17]]
-        print(
-            f"  gather done: K[0] slots 15/16/17 |sum| after {after}",
-            flush=True,
-        )
-        return out
-
-    spec_tree_mod.gather_commit_kv = logged_gather
-
-    orig_path = spec_tree_mod.find_greedy_path
-
-    def logged_path(logits, spec):
-        path, committed = orig_path(logits, spec)
-        print(
-            f"  walk path={path} committed={committed} live={spec.num_history}",
-            flush=True,
-        )
-        return path, committed
-
-    spec_tree_mod.find_greedy_path = logged_path
-
-    # reference decode state: validate each committed token as the argmax
-    # (within tie tolerance) of the reference at the evolving context
-    ref_track = _Track(
-        forward=reference.forward,
-        runner=reference,
+    # Replay the engine's own output on a fresh track of the same runner and
+    # check each committed token is the argmax (within tie tolerance) of the
+    # sequential decode at that prefix.
+    track = _Track(
+        forward=target.forward,
+        runner=target,
         block_table=list(range(NUM_BLOCKS)),
         context_len=0,
         pending_token=-1,
     )
-    ref_helper = SpeculativeEngine(
-        reference, reference, device=DEVICE,
-        block_len=BLOCK_LEN, num_blocks=NUM_BLOCKS,
+    helper = SpeculativeEngine(
+        target, target, device=DEVICE, block_len=BLOCK_LEN, num_blocks=NUM_BLOCKS
     )
-    TOL = 1e-2
     invalid: list[tuple[int, int, float]] = []
-    generated: list[int] = []
-    ref_state = {"logits": None}
-    # per-step snapshot for row-level diagnosis of the first invalid token
-    snapshot: dict = {}
-
-    def validate(token: int, output_index: int) -> None:
-        logits = ref_state["logits"]
-        top = float(logits.max())
-
-        if float(logits[token]) < top - TOL:
-            invalid.append(
-                (output_index, engine._stats.steps, top - float(logits[token]))
-            )
-
-        out = reference.forward(ref_helper._make_input(ref_track, [token]))
-        ref_track.context_len += 1
-        ref_state["logits"] = out.logits[-1]
 
     with torch.inference_mode():
-        out = reference.forward(ref_helper._make_input(ref_track, prompt_ids))
-        ref_track.context_len = len(prompt_ids)
-        ref_state["logits"] = out.logits[-1]
+        out = target.forward(helper._make_input(track, list(prompt_ids)))
+        track.context_len = len(prompt_ids)
+        logits = out.logits[-1]
 
-        first = engine.prefill(prompt_ids, greedy=True)
-        validate(first, len(generated))
-        generated.append(first)
+        for index, token in enumerate(generated):
+            top = float(logits.max())
+            deficit = top - float(logits[token])
 
-        while len(generated) < max_new and not invalid:
-            snapshot["pending"] = engine._target.pending_token
-            snapshot["live"] = engine._target.context_len
-            committed = engine.step(greedy=engine_kind == "tree")
-            snapshot.update(spec=engine._last_tree[0], logits=engine._last_tree[2])
-            snapshot["engine_cache"] = engine._target.runner.cache
-            generated.extend(committed)
+            if deficit > TOL:
+                invalid.append((index, engine._stats.steps, deficit))
 
-            if invalid and "diagnosed" not in snapshot:
-                snapshot["diagnosed"] = True
-                diagnose_row(
-                    snapshot, reference, ref_helper, ref_track,
-                    prompt_ids, generated,
-                )
-
-            for token in committed:
-                validate(token, len(generated))
-                generated.append(token)
+            out = target.forward(helper._make_input(track, [token]))
+            track.context_len += 1
+            logits = out.logits[-1]
 
     if invalid:
-        diagnose_row(snapshot, reference, ref_helper, ref_track, prompt_ids, generated)
-        diagnose_cache(snapshot, engine._target.runner.cache, reference.cache)
-
-    if not invalid:
-        print(
-            f"trajectory valid (steps={engine._stats.steps} "
-            f"acc/step={engine._stats.accepted / max(engine._stats.steps, 1):.2f})",
-            flush=True,
-        )
+        for output_index, step, deficit in invalid[:8]:
+            print(
+                f"INVALID token at output {output_index} (step {step}): "
+                f"logit deficit {deficit:.3e}",
+                flush=True,
+            )
+        print(f"invalid tokens: {len(invalid)}", flush=True)
         return
 
-    for output_index, step, deficit in invalid[:8]:
-        print(
-            f"INVALID token at output {output_index} (step {step}): "
-            f"logit deficit {deficit:.3e}",
-            flush=True,
-        )
-    print(f"invalid tokens: {len(invalid)}", flush=True)
+    print(
+        f"trajectory valid (steps={engine._stats.steps} "
+        f"acc/step={engine._stats.accepted / max(engine._stats.steps, 1):.2f})",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

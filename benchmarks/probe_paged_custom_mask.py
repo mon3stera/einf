@@ -28,14 +28,14 @@ def manual_attention(
     qo, heads, dim = q.shape
     kvh = k.shape[1]
     group = heads // kvh
-    qg = q.view(qo, kvh, group, dim).transpose(1, 2)  # [qo, group, kvh, D]
+    qg = q.view(qo, group, kvh, dim)  # head h -> kv head h // group
     scores = torch.einsum(
         "qghd,khd->qghk", qg.float(), k.float()
     ) * sm_scale  # [qo, group, kvh, kv]
     scores = scores.masked_fill(~mask.view(qo, 1, 1, -1), float("-inf"))
     probs = torch.softmax(scores, dim=-1)
     out = torch.einsum("qghk,khd->qghd", probs, v.float())
-    return out.transpose(1, 2).reshape(qo, heads, dim)
+    return out.reshape(qo, heads, dim)
 
 
 def main() -> None:

@@ -139,13 +139,15 @@ def main() -> None:
         print(f"lossless ok (steps={stats.steps})", flush=True)
         return
 
-    first = diverged[0]
-    gap = plain_gaps[first] if first < len(plain_gaps) else -1.0
-    verdict = "near-tie" if gap < 1e-2 else "WELL-SEPARATED"
+    gaps_at = [
+        (i, plain_gaps[i] if i < len(plain_gaps) else -1.0) for i in diverged
+    ]
+    separated = [g for _, g in gaps_at if g >= 1e-2]
+    worst = max(g for _, g in gaps_at)
     print(
-        f"diverged at {diverged[:6]}{'...' if len(diverged) > 6 else ''} "
-        f"first-gap={gap:.3e} ({verdict}) steps={stats.steps} "
-        f"acc/step={stats.accepted / max(stats.steps, 1):.2f}",
+        f"diverged at {diverged[:8]}{'...' if len(diverged) > 8 else ''} "
+        f"count={len(diverged)} separated={len(separated)} worst-gap={worst:.3e} "
+        f"steps={stats.steps} acc/step={stats.accepted / max(stats.steps, 1):.2f}",
         flush=True,
     )
 

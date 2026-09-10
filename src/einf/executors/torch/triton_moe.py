@@ -204,7 +204,7 @@ def moe_grouped_gemm_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for h in range(0, h_dim, BLOCK_H):
-        hs = h + tl.arange(0, BLOCK_N)
+        hs = h + tl.arange(0, BLOCK_H)
         h_mask = hs < h_dim
         a_tile = tl.load(
             a_ptr + a_rows[:, None] * stride_a_row + hs[None, :], 

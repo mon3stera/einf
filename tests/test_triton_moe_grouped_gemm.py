@@ -167,3 +167,30 @@ def test_triton_moe_expert_mlp_matches_reference_all_experts_hit() -> None:
     )
 
     _assert_rows_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "block_n,block_h",
+    [(16, 64), (64, 16), (32, 128)],
+)
+def test_triton_moe_expert_mlp_unequal_n_h_blocks(
+    block_n: int, block_h: int
+) -> None:
+    """Regression: the K reduction must advance by BLOCK_H columns per
+    iteration. The original implementation indexed the K tile with
+    BLOCK_N, which silently skipped (BLOCK_N < BLOCK_H) or double-
+    accumulated (BLOCK_N > BLOCK_H) hidden columns whenever the launch
+    config used unequal block sizes — the equal defaults masked it."""
+    hidden, topk_weights, topk_ids, w13, w2 = _make_case(
+        13, 3, 5, 256, 96, torch.bfloat16, seed=41, device=torch.device("cuda")
+    )
+
+    actual = moe_expert_mlp_triton(
+        hidden, topk_weights, topk_ids, w13, w2, block_n=block_n, block_h=block_h
+    )
+    expected = moe_expert_mlp_reference(
+        hidden, topk_weights, topk_ids, w13, w2, quantize_intermediates=True
+    )
+
+    _assert_rows_close(actual, expected)

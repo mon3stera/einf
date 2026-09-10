@@ -136,6 +136,9 @@ def test_moe_mlp_reference_path_matches_reference_direct() -> None:
     routing_weights, topk_ids = torch.topk(
         torch.softmax(router_logits, dim=-1), mlp.num_experts_per_tok, dim=-1
     )
+    routing_weights = routing_weights / routing_weights.sum(
+        dim=-1, keepdim=True
+    )
 
     w13, w2 = mlp._packed_experts(hidden)
     direct = mlp.reference_forward(hidden, routing_weights, topk_ids)

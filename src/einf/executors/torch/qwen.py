@@ -72,6 +72,15 @@ class QwenConfig:
     tie_word_embeddings: bool
     bos_token_id: int
     eos_token_id: int
+    # Qwen3-MoE extension (None for dense models): every decoder layer is a
+    # sparse expert MLP with per-token top-k routing.
+    num_experts: int | None = None
+    num_experts_per_tok: int | None = None
+    moe_intermediate_size: int | None = None
+    norm_topk_prob: bool = True
+    # Qwen3 applies per-head RMSNorm to Q/K before RoPE (QK-norm); Qwen2.5
+    # does not. Inferred from the architectures list when absent.
+    qk_norm: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -83,6 +92,7 @@ class QwenConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "QwenConfig":
+        architectures = str(data.get("architectures", ""))
         return cls(
             vocab_size=data["vocab_size"],
             hidden_size=data["hidden_size"],
@@ -97,6 +107,13 @@ class QwenConfig:
             tie_word_embeddings=data["tie_word_embeddings"],
             bos_token_id=data["bos_token_id"],
             eos_token_id=data["eos_token_id"],
+            num_experts=data.get("num_experts"),
+            num_experts_per_tok=data.get("num_experts_per_tok"),
+            moe_intermediate_size=data.get("moe_intermediate_size"),
+            norm_topk_prob=data.get("norm_topk_prob", True),
+            qk_norm=data.get(
+                "qk_norm", "Qwen3" in architectures
+            ),
         )
 
     @classmethod
@@ -195,6 +212,114 @@ class QwenMLP(nn.Module):
         )
 
 
+class QwenMoEMLP(nn.Module):
+    """Qwen3-MoE sparse expert MLP: softmax router, per-token top-k, then a
+    grouped expert GEMM.
+
+    The expert weights live as a per-expert ModuleList so ``load_state_dict``
+    accepts HuggingFace-style checkpoints (``experts.{i}.gate_proj.weight``
+    ...). The grouped Triton kernel needs stacked ``[E, 2*inter, hidden]`` /
+    ``[E, hidden, inter]`` views, built once per (device, dtype) on first
+    forward — the engine is inference-only, weights never change after
+    loading. Set ``use_reference_mlp`` to bypass the Triton path; the
+    reference implementation doubles as the correctness oracle for kernel
+    work (grouped W4A16, custom align kernels).
+    """
+
+    def __init__(self, config: QwenConfig) -> None:
+        super().__init__()
+        if config.hidden_act != "silu":
+            raise ValueError(f"unsupported Qwen activation: {config.hidden_act}")
+        if (
+            config.num_experts is None
+            or config.num_experts_per_tok is None
+            or config.moe_intermediate_size is None
+        ):
+            raise ValueError("MoE config requires num_experts, "
+                             "num_experts_per_tok and moe_intermediate_size")
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.use_reference_mlp = False
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            _MoEExpertMLP(config.hidden_size, config.moe_intermediate_size)
+            for _ in range(config.num_experts)
+        )
+        self._packed: dict[tuple, tuple[Tensor, Tensor]] = {}
+
+    def _packed_experts(self, reference: Tensor) -> tuple[Tensor, Tensor]:
+        key = (reference.device, reference.dtype)
+
+        packed = self._packed.get(key)
+        if packed is None:
+            w13 = torch.stack(
+                [
+                    torch.cat((expert.gate_proj.weight, expert.up_proj.weight), dim=0)
+                    for expert in self.experts
+                ]
+            )
+            w2 = torch.stack(
+                [expert.down_proj.weight for expert in self.experts]
+            )
+            packed = (w13.contiguous(), w2.contiguous())
+            self._packed[key] = packed
+
+        return packed
+
+    def reference_forward(
+        self,
+        hidden_states: Tensor,
+        routing_weights: Tensor,
+        topk_ids: Tensor,
+    ) -> Tensor:
+        """Reference expert MLP for the given routing — the parity oracle."""
+        from einf.executors.torch.triton_moe import moe_expert_mlp_reference
+
+        w13, w2 = self._packed_experts(hidden_states)
+        return moe_expert_mlp_reference(
+            hidden_states,
+            routing_weights,
+            topk_ids,
+            w13,
+            w2,
+            quantize_intermediates=True,
+        )
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        router_logits = self.gate(hidden_states).float()
+        routing_weights, topk_ids = torch.topk(
+            torch.softmax(router_logits, dim=-1),
+            self.num_experts_per_tok,
+            dim=-1,
+        )
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(
+                dim=-1, keepdim=True
+            )
+        if self.use_reference_mlp:
+            return self.reference_forward(
+                hidden_states, routing_weights, topk_ids
+            )
+        w13, w2 = self._packed_experts(hidden_states)
+        from einf.executors.torch.triton_moe import moe_expert_mlp_triton
+
+        return moe_expert_mlp_triton(
+            hidden_states, routing_weights, topk_ids, w13, w2
+        )
+
+
+class _MoEExpertMLP(nn.Module):
+    """One expert's gate/up/down projections, HuggingFace layout."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+
 class QwenAttention(nn.Module):
     def __init__(
         self,
@@ -233,6 +358,18 @@ class QwenAttention(nn.Module):
             bias=True,
         )
         self.o_proj = nn.Linear(attention_size, config.hidden_size, bias=False)
+        # Qwen3 applies per-head RMSNorm to Q/K right after the QKV
+        # projection, before RoPE; the norm weights broadcast across heads.
+        self.q_norm = (
+            QwenRMSNorm(config.head_dim, config.rms_norm_eps)
+            if config.qk_norm
+            else None
+        )
+        self.k_norm = (
+            QwenRMSNorm(config.head_dim, config.rms_norm_eps)
+            if config.qk_norm
+            else None
+        )
 
     def forward(
         self,
@@ -248,6 +385,11 @@ class QwenAttention(nn.Module):
             Q = Q.view(packed_len, self.num_attention_heads, self.head_dim)
             K = K.view(packed_len, self.num_key_value_heads, self.head_dim)
             V = V.view(packed_len, self.num_key_value_heads, self.head_dim)
+
+        if self.q_norm is not None:
+            with record_function("attn.qk_norm"):
+                Q = self.q_norm(Q)
+                K = self.k_norm(K)
 
         if use_flashinfer_fused(Q):
             with record_function("attn.rope"):
@@ -367,7 +509,11 @@ class QwenDecoderLayer(nn.Module):
             use_flashinfer_attention=use_flashinfer_attention,
             paged_decode_max_splits=paged_decode_max_splits,
         )
-        self.mlp = QwenMLP(config)
+        self.mlp = (
+            QwenMoEMLP(config)
+            if config.num_experts is not None
+            else QwenMLP(config)
+        )
         self.input_layernorm = QwenRMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
